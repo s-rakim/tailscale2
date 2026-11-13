@@ -18,6 +18,7 @@ Manager's Services tab, and you can stop or remove it whenever you want.
 | File | What it does |
 |---|---|
 | `Install-TailscaleService.ps1` | Puts `wintun.dll` next to `tailscaled.exe`, creates the service with Automatic start and starts it |
+| `Remove-OfficialTailscale.ps1` | Uninstalls the official app and its tray GUI, keeping your login state |
 | `Connect-Tailscale.ps1` | Logs the machine in without the GUI (opens the login page, or uses an auth key) |
 | `Uninstall-TailscaleService.ps1` | Stops and deletes the service (keeps your login state) |
 | `wintun\` | Signed `wintun.dll` 0.14.1 for amd64 and arm64, plus its license. See `wintun\README.md` |
@@ -35,10 +36,12 @@ you pick a custom service name, they use `New-Service` / `sc.exe` instead.
 If you have the official Tailscale app installed, it already owns a service
 called `Tailscale`, and it's what puts the icon in your tray. Pick one:
 
-1. **Drop the official app (no tray icon at all).** Uninstall Tailscale from
-   *Settings > Apps*. You don't need to save anything from it; the driver
-   comes from this folder. Your login in `C:\ProgramData\Tailscale` usually
-   survives, but plan on running `Connect-Tailscale.ps1` again just in case.
+1. **Drop the official app (no tray icon at all).** From an Administrator
+   PowerShell in this folder, run `.\Remove-OfficialTailscale.ps1`. It closes
+   the tray app, backs up `C:\ProgramData\Tailscale`, runs the official
+   uninstaller silently, and puts your login state back if the uninstaller
+   removed it. You don't need anything else from the official app; the driver
+   comes from `wintun\`. (Uninstalling from *Settings > Apps* works too.)
 2. **Keep the official app but hide the icon.** Leave the app installed and
    turn off *Tailscale* in *Settings > Apps > Startup* (or Task Manager >
    Startup apps). The service keeps running and the GUI no longer launches at
@@ -60,6 +63,7 @@ The rest of this page assumes option 1.
      tailscale.exe
      Install-TailscaleService.ps1
      Connect-Tailscale.ps1
+     Remove-OfficialTailscale.ps1
      Uninstall-TailscaleService.ps1
      wintun\
        LICENSE.txt
@@ -75,6 +79,7 @@ The rest of this page assumes option 1.
    cd C:\Tailscale
    Get-ChildItem -Recurse | Unblock-File
    Set-ExecutionPolicy -Scope Process Bypass -Force
+   .\Remove-OfficialTailscale.ps1     # skip if the official app is already gone
    .\Install-TailscaleService.ps1
    ```
    `Set-ExecutionPolicy -Scope Process` only applies to this PowerShell window
