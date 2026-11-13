@@ -18,7 +18,8 @@
     TS_AUTHKEY environment variable, or use -PromptForAuthKey to type it in
     without it landing in your PowerShell history.
 
-    Settings you don't pass are left as they are, unless you add -Reset.
+    Settings you don't pass are left exactly as they are (your exit node,
+    routes and so on), unless you add -Reset.
 
 .PARAMETER TailscaleExe
     Path to tailscale.exe. Defaults to one next to this script, then one next to
@@ -138,14 +139,26 @@ if ($PromptForAuthKey) {
 }
 if (-not $AuthKey -and $env:TS_AUTHKEY) { $AuthKey = $env:TS_AUTHKEY }
 
+# With no setting flags, leave every saved setting (exit node, routes, and so
+# on) exactly as it is: switch on Unattended Mode with "tailscale set", then
+# run a bare "tailscale up", which reuses the saved settings. Passing setting
+# flags to "up" would make it insist on restating every non-default setting.
+$settingsGiven = $Hostname -or $LoginServer -or $AcceptRoutes -or $ExitNode -or $AdvertiseExitNode -or $Reset
+
 $upArgs = @('up')
-if (-not $NoUnattended)  { $upArgs += '--unattended' }
-if ($Hostname)           { $upArgs += "--hostname=$Hostname" }
-if ($LoginServer)        { $upArgs += "--login-server=$LoginServer" }
-if ($AcceptRoutes)       { $upArgs += '--accept-routes' }
-if ($ExitNode)           { $upArgs += "--exit-node=$ExitNode" }
-if ($AdvertiseExitNode)  { $upArgs += '--advertise-exit-node' }
-if ($Reset)              { $upArgs += '--reset' }
+if ($settingsGiven) {
+    if (-not $NoUnattended)  { $upArgs += '--unattended' }
+    if ($Hostname)           { $upArgs += "--hostname=$Hostname" }
+    if ($LoginServer)        { $upArgs += "--login-server=$LoginServer" }
+    if ($AcceptRoutes)       { $upArgs += '--accept-routes' }
+    if ($ExitNode)           { $upArgs += "--exit-node=$ExitNode" }
+    if ($AdvertiseExitNode)  { $upArgs += '--advertise-exit-node' }
+    if ($Reset)              { $upArgs += '--reset' }
+} elseif (-not $NoUnattended) {
+    Write-Host "Switching on Unattended Mode (other settings untouched)..."
+    & $TailscaleExe set --unattended
+    if ($LASTEXITCODE -ne 0) { Write-Warning "'tailscale set --unattended' failed; continuing with login." }
+}
 if ($ForceReauth)        { $upArgs += '--force-reauth' }
 
 # Keep the key off the command line (where other processes can read it) by

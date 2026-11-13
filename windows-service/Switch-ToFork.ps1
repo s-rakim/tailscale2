@@ -112,7 +112,8 @@ Write-Host "Waiting for tailscaled to start..."
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
     try {
-        $json = & $ts status --json 2>$null | Out-String
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $json = & $ts status --json 2>$null | Out-String } finally { $ErrorActionPreference = $old }
         if ($json) { $state = ($json | ConvertFrom-Json).BackendState }
     } catch { }
     if ($state -and $state -notin 'NoState', 'Starting') { break }

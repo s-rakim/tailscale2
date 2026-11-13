@@ -18,6 +18,7 @@ Manager's Services tab, and you can stop or remove it whenever you want.
 | File | What it does |
 |---|---|
 | `Install-TailscaleService.ps1` | Puts `wintun.dll` next to `tailscaled.exe`, creates the service with Automatic start and starts it |
+| `Install-TailscaleFork.ps1` | Downloads, builds and installs everything, then runs `Switch-ToFork.ps1`. The no-copying option |
 | `Switch-ToFork.ps1` | Does all of it in one go: removes the official app, installs the service, keeps or redoes your login |
 | `Remove-OfficialTailscale.ps1` | Uninstalls the official app and its tray GUI, keeping your login state |
 | `Connect-Tailscale.ps1` | Logs the machine in without the GUI (opens the login page, or uses an auth key) |
@@ -53,6 +54,21 @@ called `Tailscale`, and it's what puts the icon in your tray. Pick one:
    `INSTALL-WINDOWS.md`.
 
 The rest of this page assumes option 1.
+
+## Fully automatic (nothing to download or copy)
+
+From an Administrator PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/s-rakim/tailscale2/windows-bundled-wintun/windows-service/Install-TailscaleFork.ps1)))
+```
+
+`Install-TailscaleFork.ps1` records your current settings, downloads this
+repo's source and a temporary Go toolchain (checksum-checked), builds
+`tailscale.exe` and `tailscaled.exe` with Wake-on-LAN built in, lays out
+`C:\Tailscale`, runs `Switch-ToFork.ps1`, and then compares your exit node,
+routes and other settings against what they were before. Run the same line
+again to update to the latest code.
 
 ## Quick version
 
