@@ -19,6 +19,7 @@ Manager's Services tab, and you can stop or remove it whenever you want.
 |---|---|
 | `Install-TailscaleService.ps1` | Puts `wintun.dll` next to `tailscaled.exe`, creates the service with Automatic start and starts it |
 | `Install-TailscaleFork.ps1` | Downloads, builds and installs everything, then runs `Switch-ToFork.ps1`. The no-copying option |
+| `Tune-Tailscale.ps1` | Finds what makes the internet lag with Tailscale on (relayed exit node, DNS, LAN access, routes), applies the safe fixes |
 | `Enable-WakeOnLan.ps1` | Lets other tailnet devices wake this PC from sleep: arms the wired adapter, advertises its MAC |
 | `Switch-ToFork.ps1` | Does all of it in one go: removes the official app, installs the service, keeps or redoes your login |
 | `Remove-OfficialTailscale.ps1` | Uninstalls the official app and its tray GUI, keeping your login state |
@@ -101,6 +102,7 @@ rather run them one at a time.
      Remove-OfficialTailscale.ps1
      Switch-ToFork.ps1
      Enable-WakeOnLan.ps1
+     Tune-Tailscale.ps1
      Uninstall-TailscaleService.ps1
      wintun\
        LICENSE.txt
@@ -135,6 +137,30 @@ rather run them one at a time.
    It opens the Tailscale login page in your browser and returns once you've
    signed in. After that the machine reconnects at every boot by itself, even
    before anyone logs in to Windows.
+
+## If the internet lags with Tailscale on
+
+Tailscale only gets in the way of ordinary internet traffic in two cases: an
+exit node is on (everything goes through it, and on Windows a firewall rule
+blocks traffic that tries to go around it, your own LAN included), and
+MagicDNS is on (every lookup goes through tailscaled). `Tune-Tailscale.ps1`
+measures both and a few other things:
+
+```powershell
+.\Tune-Tailscale.ps1 -ReportOnly   # just measure
+.\Tune-Tailscale.ps1               # measure, then apply the safe fixes
+```
+
+It reports whether the exit node is reached directly or relayed through a
+DERP server (relayed is the usual culprit, and the fix is on the exit node's
+firewall: let UDP 41641 in), how much latency the exit node adds, DNS lookup
+time through Tailscale vs. a public resolver, subnet routes that overlap your
+home LAN, and tailscaled's own health warnings.
+
+The only changes it makes by itself are turning on *allow LAN access* while an
+exit node is in use (the exit node itself is left alone; your printer, NAS and
+router page just stop taking the detour) and Unattended Mode. Everything else
+is printed as a suggestion with the command and its trade-off.
 
 ## Waking this PC from sleep
 

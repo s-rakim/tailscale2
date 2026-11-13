@@ -18,7 +18,11 @@
       5. Arms the wired network adapter for Wake-on-LAN and advertises this PC's
          MAC over the tailnet, so "tailscale wol --via=<device> <this pc>" can
          wake it from sleep (skip with -SkipWakeOnLan).
-      6. Compares your settings before and after and prints the result.
+      6. Runs Tune-Tailscale.ps1 -ReportOnly, which measures where any internet
+         lag comes from (relayed exit node, DNS, LAN access, overlapping routes)
+         and prints the fixes. Run Tune-Tailscale.ps1 afterwards to apply the
+         safe ones.
+      7. Compares your settings before and after and prints the result.
 
     It never changes your exit node or routes. Your login and settings live in
     C:\ProgramData\Tailscale, which carries over; the only setting it switches
@@ -256,7 +260,14 @@ if (-not $SkipWakeOnLan) {
     }
 }
 
-# --- 6. Prove the settings carried over ----------------------------------------
+# --- 6. Check for anything slowing the internet down --------------------------
+
+Say 'Checking for lag and other rough edges (report only; nothing changed here)'
+$global:LASTEXITCODE = 0
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir 'Tune-Tailscale.ps1') -ReportOnly
+if ($LASTEXITCODE -ne 0) { Write-Warning "Tune-Tailscale.ps1 didn't finish; run it by hand later from $InstallDir." }
+
+# --- 7. Prove the settings carried over ----------------------------------------
 
 Say 'Checking your settings carried over'
 $after = Get-TsPrefs (Join-Path $InstallDir 'tailscale.exe')
@@ -285,4 +296,5 @@ Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Done. Your fork runs from $InstallDir as the 'Tailscale' service and starts at boot." -ForegroundColor Green
+Write-Host "To apply the safe lag fixes listed above:  $InstallDir\Tune-Tailscale.ps1"
 Write-Host "To update later, run this same command again."
