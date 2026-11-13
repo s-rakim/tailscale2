@@ -60,3 +60,6 @@ client/web/build/assets
 /.stfolder
 fbstatus
 gafpush
+
+# Vendored, signed wintun driver for the Windows service bundle.
+!windows-service/wintun/*/wintun.dll
