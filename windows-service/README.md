@@ -18,6 +18,7 @@ Manager's Services tab, and you can stop or remove it whenever you want.
 | File | What it does |
 |---|---|
 | `Install-TailscaleService.ps1` | Puts `wintun.dll` next to `tailscaled.exe`, creates the service with Automatic start and starts it |
+| `Switch-ToFork.ps1` | Does all of it in one go: removes the official app, installs the service, keeps or redoes your login |
 | `Remove-OfficialTailscale.ps1` | Uninstalls the official app and its tray GUI, keeping your login state |
 | `Connect-Tailscale.ps1` | Logs the machine in without the GUI (opens the login page, or uses an auth key) |
 | `Uninstall-TailscaleService.ps1` | Stops and deletes the service (keeps your login state) |
@@ -53,6 +54,23 @@ called `Tailscale`, and it's what puts the icon in your tray. Pick one:
 
 The rest of this page assumes option 1.
 
+## Quick version
+
+With the folder laid out as below in `C:\Tailscale`, from an Administrator
+PowerShell:
+
+```powershell
+cd C:\Tailscale
+Set-ExecutionPolicy -Scope Process Bypass -Force
+Get-ChildItem -Recurse | Unblock-File
+.\Switch-ToFork.ps1
+```
+
+It removes the official app, installs your service, and reuses your saved
+login (switching it to Unattended Mode). If the login didn't survive, it opens
+the login page in your browser. The steps below are what it does, if you'd
+rather run them one at a time.
+
 ## Install
 
 1. Make a permanent folder, for example `C:\Tailscale\`. The service runs the
@@ -64,6 +82,7 @@ The rest of this page assumes option 1.
      Install-TailscaleService.ps1
      Connect-Tailscale.ps1
      Remove-OfficialTailscale.ps1
+     Switch-ToFork.ps1
      Uninstall-TailscaleService.ps1
      wintun\
        LICENSE.txt
