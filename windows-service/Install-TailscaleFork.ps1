@@ -15,7 +15,10 @@
          the signed wintun.dll next to them.
       4. Runs Switch-ToFork.ps1: removes the official app and tray GUI, installs
          the fork as the auto-start "Tailscale" service, and keeps your login.
-      5. Compares your settings before and after and prints the result.
+      5. Arms the wired network adapter for Wake-on-LAN and advertises this PC's
+         MAC over the tailnet, so "tailscale wol --via=<device> <this pc>" can
+         wake it from sleep (skip with -SkipWakeOnLan).
+      6. Compares your settings before and after and prints the result.
 
     It never changes your exit node or routes. Your login and settings live in
     C:\ProgramData\Tailscale, which carries over; the only setting it switches
@@ -29,6 +32,10 @@
 .PARAMETER InstallDir
     Where the fork lives. Default C:\Tailscale.
 
+.PARAMETER SkipWakeOnLan
+    Don't run Enable-WakeOnLan.ps1 (which arms the wired adapter so other
+    tailnet devices can wake this PC from sleep, and advertises its MAC).
+
 .PARAMETER Ref
     Git branch or tag to build. Default: main, falling back to the
     windows-bundled-wintun branch while that PR is still open.
@@ -40,7 +47,8 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\Tailscale',
-    [string]$Ref
+    [string]$Ref,
+    [switch]$SkipWakeOnLan
 )
 
 # This script is often run as a script block via irm, where "exit" would close
@@ -234,7 +242,21 @@ $global:LASTEXITCODE = 0
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir 'Switch-ToFork.ps1')
 if ($LASTEXITCODE -ne 0) { throw "Switch-ToFork.ps1 stopped (exit code $LASTEXITCODE). Its output above says where." }
 
-# --- 5. Prove the settings carried over ----------------------------------------
+# --- 5. Let the rest of the tailnet wake this PC -------------------------------
+
+if (-not $SkipWakeOnLan) {
+    Say 'Setting this PC up to be woken from sleep'
+    $global:LASTEXITCODE = 0
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallDir 'Enable-WakeOnLan.ps1') -NoRestart
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Wake-on-LAN setup didn't finish (see above). Everything else is done; run $InstallDir\Enable-WakeOnLan.ps1 later, with Ethernet plugged in."
+    } else {
+        # Enable-WakeOnLan wrote TS_WAKE_MAC; restart once so it's advertised now.
+        Restart-Service Tailscale -Force
+    }
+}
+
+# --- 6. Prove the settings carried over ----------------------------------------
 
 Say 'Checking your settings carried over'
 $after = Get-TsPrefs (Join-Path $InstallDir 'tailscale.exe')

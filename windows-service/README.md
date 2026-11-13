@@ -19,6 +19,7 @@ Manager's Services tab, and you can stop or remove it whenever you want.
 |---|---|
 | `Install-TailscaleService.ps1` | Puts `wintun.dll` next to `tailscaled.exe`, creates the service with Automatic start and starts it |
 | `Install-TailscaleFork.ps1` | Downloads, builds and installs everything, then runs `Switch-ToFork.ps1`. The no-copying option |
+| `Enable-WakeOnLan.ps1` | Lets other tailnet devices wake this PC from sleep: arms the wired adapter, advertises its MAC |
 | `Switch-ToFork.ps1` | Does all of it in one go: removes the official app, installs the service, keeps or redoes your login |
 | `Remove-OfficialTailscale.ps1` | Uninstalls the official app and its tray GUI, keeping your login state |
 | `Connect-Tailscale.ps1` | Logs the machine in without the GUI (opens the login page, or uses an auth key) |
@@ -99,6 +100,7 @@ rather run them one at a time.
      Connect-Tailscale.ps1
      Remove-OfficialTailscale.ps1
      Switch-ToFork.ps1
+     Enable-WakeOnLan.ps1
      Uninstall-TailscaleService.ps1
      wintun\
        LICENSE.txt
@@ -133,6 +135,35 @@ rather run them one at a time.
    It opens the Tailscale login page in your browser and returns once you've
    signed in. After that the machine reconnects at every boot by itself, even
    before anyone logs in to Windows.
+
+## Waking this PC from sleep
+
+A sleeping PC is off the tailnet, so nothing can reach it over Tailscale
+directly. What works is an awake device on the same LAN sending it a
+Wake-on-LAN magic packet, and `tailscale wol --via` does that relay for you.
+`Enable-WakeOnLan.ps1` does the part on the PC that sleeps:
+
+```powershell
+.\Enable-WakeOnLan.ps1                 # wired adapter, wake on magic packet only
+.\Enable-WakeOnLan.ps1 -FromShutdown   # also from "Shut down" (turns off Fast Startup)
+```
+
+It turns on "wake on magic packet" for the wired adapter, arms it in
+`powercfg`, and writes `TS_WAKE_MAC=<mac>` to
+`C:\ProgramData\Tailscale\tailscaled-env.txt`, which makes tailscaled advertise
+the MAC so you can wake the PC by name. `Install-TailscaleFork.ps1` runs it for
+you unless you pass `-SkipWakeOnLan`.
+
+Then, from any device in your tailnet:
+
+```powershell
+tailscale wol --via=nas latitude      # "nas" is awake on the same LAN as "latitude"
+```
+
+Two things Windows can't set for you: in the BIOS (F2 on a Dell) set *Wake on
+LAN* to "LAN Only" and *Deep Sleep Control* to Disabled, and keep Ethernet
+plugged in while it sleeps. Nearly all laptops only wake over Ethernet, not
+Wi-Fi, and many only while on the charger.
 
 ## Logging in without the GUI
 
