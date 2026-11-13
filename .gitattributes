@@ -58,3 +58,6 @@ go.mod filter=go-mod eol=lf text
 *.yaml eol=lf text
 *.yml eol=lf text
 *.zsh eol=lf text
+# Vendored wintun files are kept byte-for-byte as shipped in wintun-0.14.1.zip.
+windows-service/wintun/** -text
+*.dll binary
