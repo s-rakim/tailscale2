@@ -30,7 +30,7 @@ func (c *connector) handleTransitIPRequest(n tailcfg.NodeView, peerV4 netip.Addr
 		return TransitIPResponse{Code: AddrFamilyMismatch, Message: addrFamilyMismatchMessage}
 	}
 
-	if routelimits.IsDisallowed(tipr.DestinationIP) {
+	if c.destIsDisallowed(tipr.DestinationIP) {
 		return TransitIPResponse{Code: DisallowedDestination, Message: disallowedDestinationMessage}
 	}
 
@@ -94,6 +94,9 @@ type connector struct {
 
 	// Remember to add new fields to [connector.reset] if needed.
 	mu sync.Mutex // protects the fields below
+	// tokenSecret is the random secret used to mint and verify tokens in TransitIPRequests.
+	// It is generated in memory at creation, rotated on [connector.reset] (ie on profile change), and not persisted.
+	tokenSecret [tokenSecretLen]byte
 	// transitIPs is a map of connector client peer IP -> client transitIPs that we update as connector client peers instruct us to, and then use to route traffic to its destination on behalf of connector clients.
 	// Note that each peer could potentially have two maps: one for its IPv4 address, and one for its IPv6 address. The transit IPs map for a given peer IP will contain transit IPs of the same family as the peer's IP.
 	transitIPs map[netip.Addr]map[netip.Addr]appAddr
@@ -124,6 +127,26 @@ func (c *connector) transitIPInPool(tip netip.Addr) bool {
 		return ipSets.v4Transit != nil && ipSets.v4Transit.Contains(tip)
 	}
 	return ipSets.v6Transit != nil && ipSets.v6Transit.Contains(tip)
+}
+
+func (c *connector) destIsDisallowed(dst netip.Addr) bool {
+	if routelimits.IsDisallowed(dst) || c.destinationInPools(dst) {
+		return true
+	}
+	// TODO(tailscale/corp#50542): remove this condition when we have a configurable check
+	return dst.IsPrivate()
+}
+
+// destinationInPool reports whether dst is within one of the magic or transit IP pools,
+// of its address family, that this connector is configured with. Forwarding to such
+// an address would route back into conn25's own mapping layer rather than out to an app.
+func (c *connector) destinationInPools(dst netip.Addr) bool {
+	ipSets := c.getIPSets()
+	magic, transit := ipSets.v6Magic, ipSets.v6Transit
+	if dst.Unmap().Is4() {
+		magic, transit = ipSets.v4Magic, ipSets.v4Transit
+	}
+	return (magic != nil && magic.Contains(dst)) || (transit != nil && transit.Contains(dst))
 }
 
 // packetFilterAllow returns true if the provided packet has a Src that is in
@@ -229,4 +252,6 @@ func (c *connector) reset() {
 
 	c.transitIPs = make(map[netip.Addr]map[netip.Addr]appAddr)
 	c.expiryQueue = list.New()
+	// old tokens should no longer verify
+	c.tokenSecret = newTokenSecret()
 }

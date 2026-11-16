@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -18,15 +19,19 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"tailscale.com/k8s-operator/apis/v1alpha1"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/reconciler/tailscaled"
 	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/net/dns/resolvconffile"
@@ -1977,7 +1982,7 @@ func Test_metricsResourceCreation(t *testing.T) {
 			LoadBalancerClass: new("tailscale"),
 		},
 	}
-	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: serviceMonitorCRD}}
+	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: tailscaled.ServiceMonitorCRD}}
 	fc := fake.NewClientBuilder().
 		WithScheme(tsapi.GlobalScheme).
 		WithObjects(pc, svc).
@@ -2045,7 +2050,7 @@ func Test_metricsResourceCreation(t *testing.T) {
 		pc.Spec.Metrics = nil
 	})
 	expectReconciled(t, sr, "default", "test")
-	expectMissing[corev1.Service](t, fc, "operator-ns", metricsResourceName(opts.stsName))
+	expectMissing[corev1.Service](t, fc, "operator-ns", tailscaled.MetricsResourceName(opts.stsName))
 	// ServiceMonitor gets garbage collected when Service gets deleted (it has OwnerReference of the Service
 	// object). We cannot test this using the fake client.
 }
@@ -2242,4 +2247,81 @@ func TestNodeHandlerForConnector(t *testing.T) {
 			t.Fatalf("expected no reconcile requests, got %v", got)
 		}
 	})
+}
+
+func TestStateSecretHandlerForProxyGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   []reconcile.Request
+	}{
+		{
+			name:   "state_secret",
+			labels: pgSecretLabels("test", kubetypes.LabelSecretTypeState),
+			want:   []reconcile.Request{{NamespacedName: types.NamespacedName{Name: "test"}}},
+		},
+		{
+			name:   "config_secret",
+			labels: pgSecretLabels("test", kubetypes.LabelSecretTypeConfig),
+		},
+		{
+			name: "unmanaged_secret",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-0",
+					Namespace: tsNamespace,
+					Labels:    tc.labels,
+				},
+			}
+			got := stateSecretHandlerForProxyGroup(t.Context(), secret)
+			if diff := cmp.Diff(got, tc.want); diff != "" {
+				t.Fatalf("unexpected reconcile requests (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestServiceOptimisticLockErrorRequeues(t *testing.T) {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: new("tailscale"),
+		},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(svc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*corev1.Service); ok {
+					return apierrors.NewConflict(schema.GroupResource{Resource: "services"}, obj.GetName(), errors.New(optimisticLockErrorMsg))
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			clients:           tsclient.NewProvider(&fakeTSClient{}),
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:   zap.Must(zap.NewDevelopment()).Sugar(),
+		clock:    tstest.NewClock(tstest.ClockOpts{}),
+		recorder: record.NewFakeRecorder(100),
+	}
+
+	expectRequeue(t, sr, "default", "test")
 }

@@ -37,13 +37,20 @@ import (
 
 	"tailscale.com/ipn"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/reconciler/tailscaled"
 	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/types/key"
 	"tailscale.com/util/mak"
 )
 
 const (
 	vipTestIP = "5.6.7.8"
+
+	// tsNamespace is the namespace the operator is installed in for tests that don't override it.
+	tsNamespace = "tailscale"
+
+	optimisticLockErrorMsg = "the object has been modified; please apply your changes to the latest version and try again"
 )
 
 // confgOpts contains configuration options for creating cluster resources for
@@ -445,7 +452,7 @@ func expectedMetricsService(opts configOpts) *corev1.Service {
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      metricsResourceName(opts.stsName),
+			Name:      tailscaled.MetricsResourceName(opts.stsName),
 			Namespace: opts.tailscaleNamespace,
 			Labels:    labels,
 		},
@@ -479,10 +486,11 @@ func expectedServiceMonitor(t *testing.T, opts configOpts) *unstructured.Unstruc
 	t.Helper()
 	smLabels := metricsLabels(opts)
 	if len(opts.serviceMonitorLabels) != 0 {
-		smLabels = mergeMapKeys(smLabels, opts.serviceMonitorLabels.Parse())
+		smLabels = opts.serviceMonitorLabels.Parse()
+		maps.Copy(smLabels, metricsLabels(opts))
 	}
-	name := metricsResourceName(opts.stsName)
-	sm := &ServiceMonitor{
+	name := tailscaled.MetricsResourceName(opts.stsName)
+	sm := &tailscaled.ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       opts.tailscaleNamespace,
@@ -494,12 +502,12 @@ func expectedServiceMonitor(t *testing.T, opts configOpts) *unstructured.Unstruc
 			Kind:       "ServiceMonitor",
 			APIVersion: "monitoring.coreos.com/v1",
 		},
-		Spec: ServiceMonitorSpec{
+		Spec: tailscaled.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{MatchLabels: metricsLabels(opts)},
-			Endpoints: []ServiceMonitorEndpoint{{
+			Endpoints: []tailscaled.ServiceMonitorEndpoint{{
 				Port: "metrics",
 			}},
-			NamespaceSelector: ServiceMonitorNamespaceSelector{
+			NamespaceSelector: tailscaled.ServiceMonitorNamespaceSelector{
 				MatchNames: []string{opts.tailscaleNamespace},
 			},
 			JobLabel: "ts_prom_job",
@@ -510,7 +518,7 @@ func expectedServiceMonitor(t *testing.T, opts configOpts) *unstructured.Unstruc
 			},
 		},
 	}
-	u, err := serviceMonitorToUnstructured(sm)
+	u, err := tailscaled.ServiceMonitorToUnstructured(sm)
 	if err != nil {
 		t.Fatalf("error converting ServiceMonitor to unstructured: %v", err)
 	}
@@ -946,6 +954,21 @@ func (m *fakeDevices) Get(_ context.Context, id string) (*tailscale.Device, erro
 	}
 
 	return nil, tailscale.APIError{Status: http.StatusNotFound}
+}
+
+// setUnreportedDevice leaves only a machine key in state Secret name and registers a device with that key, as if
+// tailscaled registered with control but never reported its device ID.
+func setUnreportedDevice(t *testing.T, cl client.Client, tsClient *fakeTSClient, name, nodeID string) {
+	t.Helper()
+	mk := key.NewMachine()
+	mkText, err := mk.MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustUpdate(t, cl, tsNamespace, name, func(s *corev1.Secret) {
+		s.Data = map[string][]byte{string(ipn.MachineKeyStateKey): mkText}
+	})
+	tsClient.devices = append(tsClient.devices, tailscale.Device{NodeID: nodeID, MachineKey: mk.Public().String()})
 }
 
 func (c *fakeTSClient) Keys() tsclient.KeyResource {

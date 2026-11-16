@@ -1,6 +1,6 @@
 module tailscale.com
 
-go 1.27.3
+go 1.27.4
 
 require (
 	filippo.io/mkcert v1.4.4
@@ -57,12 +57,12 @@ require (
 	github.com/go4org/plan9netshell v0.0.0-20250324183649-788daa080737
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/gokrazy/breakglass v0.0.0-20260711072910-0f882c44303e
-	github.com/gokrazy/firmware v0.0.0-20260916135839-f966a2e0e4b0
+	github.com/gokrazy/firmware v0.0.0-20261103105416-6bd1fd16a2e2
 	github.com/gokrazy/gokrazy v0.0.0-20260916140236-39fe3e5557b8
-	github.com/gokrazy/kernel.amd64 v0.0.0-20260926085050-5a347b66f180
-	github.com/gokrazy/kernel.arm64 v0.0.0-20260926085557-3998e71b7b1d
-	github.com/gokrazy/kernel.rpi v0.0.0-20260911133309-2cbf751e3f2a
-	github.com/gokrazy/rpi-eeprom v0.0.0-20260924082843-6a92fdda349c
+	github.com/gokrazy/kernel.amd64 v0.0.0-20261111110037-eb0ff0075854
+	github.com/gokrazy/kernel.arm64 v0.0.0-20261111111623-595ae821533a
+	github.com/gokrazy/kernel.rpi v0.0.0-20261103170006-85ea215f0624
+	github.com/gokrazy/rpi-eeprom v0.0.0-20261031093638-30711eb43bb5
 	github.com/gokrazy/serial-busybox v0.0.0-20250119153030-ac58ba7574e7
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/golang/snappy v1.0.0
@@ -86,7 +86,7 @@ require (
 	github.com/jsimonetti/rtnetlink v1.4.2
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/kdomanski/iso9660 v0.4.0
-	github.com/klauspost/compress v1.20.0
+	github.com/klauspost/compress v1.20.2
 	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a
 	github.com/mattn/go-colorable v0.1.15
 	github.com/mattn/go-isatty v0.0.24
@@ -126,7 +126,7 @@ require (
 	github.com/tailscale/ts-gokrazy v0.0.0-20260630224145-b83088f2e52e
 	github.com/tailscale/web-client-prebuilt v0.0.0-20260917222731-e0ed2d0d0fea
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6
-	github.com/tailscale/wireguard-go v0.0.0-20261002162406-18e99eba5393
+	github.com/tailscale/wireguard-go v0.0.0-20261110220948-9e10ef9af415
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e
 	github.com/tc-hib/winres v0.3.1
 	github.com/tcnksm/go-httpstat v0.2.0
@@ -144,7 +144,7 @@ require (
 	golang.org/x/net v0.62.0
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.24.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	golang.org/x/term v0.47.0
 	golang.org/x/text v0.43.0
 	golang.org/x/time v0.16.0

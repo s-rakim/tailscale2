@@ -210,6 +210,21 @@ const (
 	// non-zero peer states, and subsequent Notifies include per-peer
 	// state changes.
 	NotifyPeerWireGuardState NotifyWatchOpt = 1 << 18
+
+	// NotifySuspendWhenBehind, if set, makes tailscaled suspend the watcher
+	// instead of closing the watch when it falls behind. The watcher gets a
+	// [Notify] with [Notify.Suspended] set and nothing else until the client
+	// resumes the session via the "resume-ipn-bus" LocalAPI endpoint or
+	// LocalBackend.ResumeWatchNotifications. Resuming replays the initial
+	// Notify and new notifications follow from there.
+	//
+	// GUI clients want this when closing the watch has side effects, such as
+	// on Windows, where the last client disconnecting can reset the backend
+	// state.
+	//
+	// It requires [NotifyInitialState] and cannot be combined with
+	// [NotifyInProcessNoDisconnect].
+	NotifySuspendWhenBehind NotifyWatchOpt = 1 << 19
 )
 
 // String implements the [fmt.Stringer] interface.
@@ -253,6 +268,7 @@ func (o NotifyWatchOpt) String() string {
 	try(NotifyInProcessNoDisconnect, "NotifyInProcessNoDisconnect")
 	try(NotifySysPolicyChanges, "NotifySysPolicyChanges")
 	try(NotifyPeerWireGuardState, "NotifyPeerWireGuardState")
+	try(NotifySuspendWhenBehind, "NotifySuspendWhenBehind")
 
 	if mask != o {
 		bits = append(bits, fmt.Sprintf("%T(%#x)", o, uint64(o^mask))) // unknown
@@ -297,6 +313,14 @@ func ValidateNotifyWatchOpt(mask NotifyWatchOpt) error {
 	if mask&ObsoleteNotifyInitialNetMap != 0 {
 		return errors.New("the NotifyInitialNetMap IPN bus subscription bit is no longer supported; seed from NotifyInitialStatus instead")
 	}
+	if mask&NotifySuspendWhenBehind != 0 {
+		if mask&NotifyInitialState == 0 {
+			return errors.New("NotifySuspendWhenBehind requires NotifyInitialState")
+		}
+		if mask&NotifyInProcessNoDisconnect != 0 {
+			return errors.New("NotifySuspendWhenBehind is incompatible with NotifyInProcessNoDisconnect")
+		}
+	}
 	return nil
 }
 
@@ -327,6 +351,11 @@ type Notify struct {
 	// For State InUseOtherUser, ErrMessage is not critical and just contains the details.
 	ErrMessage *string
 
+	// Suspended, if true, means the watcher fell behind and tailscaled has
+	// stopped sending it notifications. Nothing else arrives until the
+	// client resumes the session; see [NotifySuspendWhenBehind].
+	Suspended bool `json:",omitzero"`
+
 	LoginFinished *empty.Message // non-nil when/if the login process succeeded
 	State         *State         // if non-nil, the new or current IPN state
 	Prefs         *PrefsView     // if non-nil && Valid, the new or current preferences
@@ -355,13 +384,19 @@ type Notify struct {
 	// a continuous view of node state without fetching the netmap.
 	InitialStatus *ipnstate.Status `json:",omitzero"`
 
-	// NodeGUIVisibility, when non-nil, is a complete snapshot of GUI
-	// visibility state for the current node and peers, keyed by stable node ID.
-	// It is sent to watchers that requested [NotifySysPolicyChanges]. Clients
-	// should replace their previous visibility state with this map.
+	// NodeGUIVisibility, when non-empty, lists the nodes that GUI clients
+	// should hide, keyed by stable node ID, among the nodes this Notify
+	// covers: all nodes if it carries [Notify.Policy] (initially and on
+	// policy change), or the peers in [Notify.PeersChanged] otherwise.
+	// Covered nodes absent from the map are visible, so a Notify carrying
+	// Policy replaces any previously received visibility state, while one
+	// carrying PeersChanged updates it for the changed peers only.
+	//
+	// It is populated for watchers that requested [NotifySysPolicyChanges];
+	// incremental updates additionally require [NotifyPeerChanges].
 	//
 	// This is presentation metadata only. Nodes remain present in status,
-	// peer notifications, åand the underlying netmap.
+	// peer notifications, and the underlying netmap.
 	NodeGUIVisibility map[tailcfg.StableNodeID]NodeGUIVisibility `json:",omitzero"`
 
 	// PeerChangedPatch, if non-empty, lists narrow per-field peer patches
@@ -563,6 +598,9 @@ func (n Notify) String() string {
 	sb.WriteString("Notify{")
 	if n.ErrMessage != nil {
 		fmt.Fprintf(&sb, "err=%q ", *n.ErrMessage)
+	}
+	if n.Suspended {
+		sb.WriteString("Suspended ")
 	}
 	if n.LoginFinished != nil {
 		sb.WriteString("LoginFinished ")

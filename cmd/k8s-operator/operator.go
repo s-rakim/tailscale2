@@ -58,6 +58,7 @@ import (
 	"tailscale.com/k8s-operator/reconciler/peerrelay"
 	"tailscale.com/k8s-operator/reconciler/proxyclass"
 	"tailscale.com/k8s-operator/reconciler/proxygrouppolicy"
+	"tailscale.com/k8s-operator/reconciler/recorder"
 	"tailscale.com/k8s-operator/reconciler/tailnet"
 	"tailscale.com/k8s-operator/reconciler/tailscaled"
 	"tailscale.com/k8s-operator/tsclient"
@@ -325,7 +326,7 @@ func runReconcilers(opts reconcilerOpts) {
 	// ServiceMonitor CRD applied after some of our resources that define ServiceMonitor creation. This selector
 	// ensures that we only watch the ServiceMonitor CRD and that we don't cache full contents of it.
 	serviceMonitorSelector := cache.ByObject{
-		Field:     fields.SelectorFromSet(fields.Set{"metadata.name": serviceMonitorCRD}),
+		Field:     fields.SelectorFromSet(fields.Set{"metadata.name": tailscaled.ServiceMonitorCRD}),
 		Transform: crdTransformer(startlog),
 	}
 
@@ -674,26 +675,16 @@ func runReconcilers(opts reconcilerOpts) {
 		startlog.Fatalf("could not create DNS records reconciler: %v", err)
 	}
 
-	// Recorder reconciler.
-	recorderFilter := handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &tsapi.Recorder{})
-	err = builder.ControllerManagedBy(mgr).
-		For(&tsapi.Recorder{}).
-		Named("recorder-reconciler").
-		Watches(&appsv1.StatefulSet{}, recorderFilter).
-		Watches(&corev1.ServiceAccount{}, recorderFilter).
-		Watches(&corev1.Secret{}, recorderFilter).
-		Watches(&rbacv1.Role{}, recorderFilter).
-		Watches(&rbacv1.RoleBinding{}, recorderFilter).
-		Complete(&RecorderReconciler{
-			recorder:    eventRecorder,
-			tsNamespace: opts.tailscaleNamespace,
-			Client:      mgr.GetClient(),
-			log:         opts.log.Named("recorder-reconciler"),
-			clock:       tstime.DefaultClock{},
-			clients:     clients,
-			reissuer:    tailscaled.NewReissuer(),
-		})
-	if err != nil {
+	recorderOptions := recorder.ReconcilerOptions{
+		Client:             mgr.GetClient(),
+		Recorder:           eventRecorder,
+		TailscaleNamespace: opts.tailscaleNamespace,
+		Clients:            clients,
+		Logger:             opts.log,
+		Clock:              tstime.DefaultClock{},
+	}
+
+	if err = recorder.NewReconciler(recorderOptions).Register(mgr); err != nil {
 		startlog.Fatalf("could not create Recorder reconciler: %v", err)
 	}
 
@@ -728,6 +719,7 @@ func runReconcilers(opts reconcilerOpts) {
 	nodeFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(nodeHandlerForProxyGroup(mgr.GetClient(), opts.defaultProxyClass, startlog))
 	saFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(serviceAccountHandlerForProxyGroup(mgr.GetClient(), startlog))
 	acmeSecretFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(acmeAccountsSecretHandlerForProxyGroup(mgr.GetClient(), opts.tailscaleNamespace, opts.sharedACMEAccountKey, startlog))
+	stateSecretFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(stateSecretHandlerForProxyGroup)
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.ProxyGroup{}).
 		Named("proxygroup-reconciler").
@@ -739,6 +731,8 @@ func runReconcilers(opts reconcilerOpts) {
 		// The shared ACME accounts Secret has no ProxyGroup owner ref, so
 		// watch it by name to react to its deletion/recreation.
 		Watches(&corev1.Secret{}, acmeSecretFilterForProxyGroup).
+		// State Secrets have no owner ref, so watch them by label.
+		Watches(&corev1.Secret{}, stateSecretFilterForProxyGroup).
 		Watches(&rbacv1.Role{}, ownedByProxyGroupFilter).
 		Watches(&rbacv1.RoleBinding{}, ownedByProxyGroupFilter).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForProxyGroup).
@@ -1207,6 +1201,21 @@ func acmeAccountsSecretHandlerForProxyGroup(cl client.Client, tsNamespace string
 		}
 		return reqs
 	}
+}
+
+// stateSecretHandlerForProxyGroup enqueues the ProxyGroup that a state Secret
+// belongs to. State Secrets carry no owner reference, so the owner-based Secret
+// watch never matches them.
+func stateSecretHandlerForProxyGroup(_ context.Context, o client.Object) []reconcile.Request {
+	secret, ok := o.(*corev1.Secret)
+	if !ok || !isPGStateSecret(secret) {
+		return nil
+	}
+	pgName := secret.ObjectMeta.Labels[LabelParentName]
+	if pgName == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: pgName}}}
 }
 
 // serviceHandlerForIngress returns a handler for Service events for ingress
