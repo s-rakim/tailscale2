@@ -125,15 +125,25 @@ func resolveTargetMACs(nb ipnext.NodeBackend, target string) ([]net.HardwareAddr
 // findNode returns the node (self or a peer) whose Tailscale IP, MagicDNS
 // name, or short hostname matches s.
 func findNode(nb ipnext.NodeBackend, s string) (_ tailcfg.NodeView, ok bool) {
+	// Only uses NodeBackend methods that exist in every recent release, so
+	// this file applies cleanly on top of stable tags as well as main.
+	var match func(tailcfg.NodeView) bool
 	if ip, err := netip.ParseAddr(s); err == nil {
-		id, ok := nb.NodeByAddr(ip)
-		if !ok {
-			return tailcfg.NodeView{}, false
+		match = func(n tailcfg.NodeView) bool {
+			if !n.Valid() {
+				return false
+			}
+			for _, a := range n.Addresses().All() {
+				if a.IsSingleIP() && a.Addr() == ip {
+					return true
+				}
+			}
+			return false
 		}
-		return nb.NodeByID(id)
-	}
-	match := func(n tailcfg.NodeView) bool {
-		return n.Valid() && nodeNameMatches(n, s)
+	} else {
+		match = func(n tailcfg.NodeView) bool {
+			return n.Valid() && nodeNameMatches(n, s)
+		}
 	}
 	if self := nb.Self(); match(self) {
 		return self, true
