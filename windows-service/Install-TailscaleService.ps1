@@ -92,20 +92,81 @@ $BinaryPath = (Resolve-Path $BinaryPath).Path
 Write-Host "Using tailscaled: $BinaryPath"
 
 # tailscaled needs wintun.dll for its network adapter, and only looks next to
-# the exe and in System32 (see cmd/tailscaled/tailscaled_windows.go).
-$wintunNextToExe = Join-Path (Split-Path $BinaryPath) 'wintun.dll'
-$wintunSystem32 = Join-Path $env:SystemRoot 'System32\wintun.dll'
-if (-not (Test-Path $wintunNextToExe) -and -not (Test-Path $wintunSystem32)) {
-    Write-Error @"
-wintun.dll not found next to tailscaled.exe or in System32.
+# the exe and in System32 (see cmd/tailscaled/tailscaled_windows.go). The repo
+# ships a signed copy in .\wintun\<arch>\, so copy that in when it's missing.
+# The hashes match wintun 0.14.1 from wintun.net (see wintun\README.md).
+$WintunHashes = @{
+    'amd64' = 'E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE'
+    'arm64' = 'F7BA89005544BE9D85231A9E0D5F23B2D15B3311667E2DAD0DEBD344918A3F80'
+}
 
-tailscaled can't create its network adapter without it. Either copy it from an
-official install (C:\Program Files\Tailscale\wintun.dll), or download
-https://www.wintun.net/builds/wintun-0.14.1.zip and take wintun\bin\amd64\wintun.dll
-(arm64 for ARM PCs). Put it here:
+function Get-PEArch([string]$Path) {
+    # Read the COFF Machine field so we match the DLL to the exe, not to the OS
+    # (an amd64 tailscaled on an ARM PC still needs the amd64 wintun.dll).
+    $fs = [IO.File]::OpenRead($Path)
+    try {
+        $br = New-Object IO.BinaryReader($fs)
+        $fs.Position = 0x3C
+        $fs.Position = $br.ReadInt32() + 4
+        switch ($br.ReadUInt16()) {
+            0x8664 { return 'amd64' }
+            0xAA64 { return 'arm64' }
+            default { return $null }
+        }
+    } finally { $fs.Dispose() }
+}
+
+function Test-Wintun([string]$Path, [string]$Arch) {
+    $hash = (Get-FileHash -Algorithm SHA256 $Path).Hash
+    if ($hash -ne $WintunHashes[$Arch]) {
+        Write-Warning "$Path has SHA-256 $hash, expected $($WintunHashes[$Arch]) for $Arch."
+        return $false
+    }
+    $sig = Get-AuthenticodeSignature $Path
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'WireGuard LLC') {
+        Write-Warning "$Path is not validly signed by WireGuard LLC (status: $($sig.Status))."
+        return $false
+    }
+    return $true
+}
+
+$exeDir = Split-Path $BinaryPath
+$wintunNextToExe = Join-Path $exeDir 'wintun.dll'
+$wintunSystem32 = Join-Path $env:SystemRoot 'System32\wintun.dll'
+
+if (Test-Path $wintunNextToExe) {
+    Write-Host "Found wintun.dll next to tailscaled.exe."
+} else {
+    $arch = Get-PEArch $BinaryPath
+    if (-not $arch) {
+        Write-Error "Couldn't tell what CPU architecture $BinaryPath was built for. Expected amd64 or arm64."
+        exit 1
+    }
+    $bundled = @(
+        (Join-Path $PSScriptRoot "wintun\$arch\wintun.dll"),
+        (Join-Path $PSScriptRoot 'wintun.dll')
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if ($bundled -and (Test-Wintun $bundled $arch)) {
+        Copy-Item $bundled $wintunNextToExe
+        $license = Join-Path $PSScriptRoot 'wintun\LICENSE.txt'
+        if (Test-Path $license) { Copy-Item $license (Join-Path $exeDir 'wintun-LICENSE.txt') -Force }
+        Write-Host "Copied bundled $arch wintun.dll to $wintunNextToExe"
+    } elseif (Test-Path $wintunSystem32) {
+        Write-Host "Using wintun.dll from System32."
+    } else {
+        Write-Error @"
+No usable wintun.dll for $arch.
+
+tailscaled can't create its network adapter without it. The repo ships one at
+windows-service\wintun\$arch\wintun.dll; keep the 'wintun' folder next to this
+script, or put wintun.dll from
+https://www.wintun.net/builds/wintun-0.14.1.zip (wintun\bin\$arch\wintun.dll)
+here:
     $wintunNextToExe
 "@
-    exit 1
+        exit 1
+    }
 }
 
 # Bail out early if the service already exists.
@@ -163,6 +224,6 @@ Write-Host ""
 Write-Host "Done. Service '$($svc.Name)' is $($svc.Status), StartType=$((Get-Service -Name $ServiceName).StartType)." -ForegroundColor Green
 Write-Host "It will now start automatically on every boot, in the background, with no window."
 Write-Host ""
-Write-Host "Next, bring the node up (once, interactively):"
-Write-Host "    tailscale up"
+Write-Host "Next, log in once:"
+Write-Host "    .\Connect-Tailscale.ps1"
 Write-Host "After that it reconnects on its own at boot."
