@@ -95,6 +95,12 @@ if (-not $removed) {
     }
 }
 
+# The fork's update task would put the service back on its next run.
+if (Get-ScheduledTask -TaskName 'Tailscale fork update' -ErrorAction SilentlyContinue) {
+    Write-Host "Removing the 'Tailscale fork update' scheduled task..."
+    Unregister-ScheduledTask -TaskName 'Tailscale fork update' -Confirm:$false
+}
+
 Write-Host ""
 Write-Host "Done. Service '$ServiceName' removed." -ForegroundColor Green
 Write-Host "tailscaled.exe and your login state were left in place."

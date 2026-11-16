@@ -18,7 +18,7 @@ Manager's Services tab, and you can stop or remove it whenever you want.
 | File | What it does |
 |---|---|
 | `Install-TailscaleService.ps1` | Puts `wintun.dll` next to `tailscaled.exe`, creates the service with Automatic start and starts it |
-| `Install-TailscaleFork.ps1` | Downloads, builds and installs everything, then runs `Switch-ToFork.ps1`. The no-copying option |
+| `Install-TailscaleFork.ps1` | Builds the fork on the latest official release, installs it, and keeps it updated. The no-copying option |
 | `Tune-Tailscale.ps1` | Finds what makes the internet lag with Tailscale on (relayed exit node, DNS, LAN access, routes), applies the safe fixes |
 | `Enable-WakeOnLan.ps1` | Lets other tailnet devices wake this PC from sleep: arms the wired adapter, advertises its MAC |
 | `Switch-ToFork.ps1` | Does all of it in one go: removes the official app, installs the service, keeps or redoes your login |
@@ -62,15 +62,42 @@ The rest of this page assumes option 1.
 From an Administrator PowerShell:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/s-rakim/tailscale2/windows-bundled-wintun/windows-service/Install-TailscaleFork.ps1)))
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/s-rakim/tailscale2/windows-one-command/windows-service/Install-TailscaleFork.ps1)))
 ```
 
-`Install-TailscaleFork.ps1` records your current settings, downloads this
-repo's source and a temporary Go toolchain (checksum-checked), builds
-`tailscale.exe` and `tailscaled.exe` with Wake-on-LAN built in, lays out
-`C:\Tailscale`, runs `Switch-ToFork.ps1`, and then compares your exit node,
-routes and other settings against what they were before. Run the same line
-again to update to the latest code.
+`Install-TailscaleFork.ps1` asks Tailscale's update service
+(pkgs.tailscale.com) for the current stable version, downloads that
+release's source from github.com/tailscale/tailscale, applies this fork's
+changes from `patches/fork-changes.patch`, and builds `tailscale.exe` and
+`tailscaled.exe` with a temporary Go toolchain and portable Git. Then it lays
+out `C:\Tailscale`, runs `Switch-ToFork.ps1` (official app out, service in,
+login kept), and compares your exit node, routes and other settings against
+what they were before.
+
+### Updates
+
+Tailscale's own auto-update can only install the official build, so it would
+replace the fork. The installer turns it off (`tailscale set
+--auto-update=false`) and registers a scheduled task, *Tailscale fork update*,
+that runs daily at 4 AM as SYSTEM. It checks pkgs.tailscale.com, and when a
+new official release is out it rebuilds the fork on that release and swaps
+the two `.exe` files in. Login and settings carry over. Its log is
+`C:\Tailscale\update.log`, and the version it built on is in
+`C:\Tailscale\upstream-version.txt`.
+
+```powershell
+Start-ScheduledTask 'Tailscale fork update'                  # check now
+Unregister-ScheduledTask 'Tailscale fork update' -Confirm:$false   # stop updating
+```
+
+If a new release changes code under one of the fork's files so the patch no
+longer applies, the update builds this repo's branch as-is instead and says
+so in the log. After changing the fork's Go code, regenerate the patch from a
+checkout that has upstream as a remote:
+
+```sh
+git diff upstream/main HEAD -- . ':!windows-service' ':!.gitattributes' ':!.gitignore' > windows-service/patches/fork-changes.patch
+```
 
 ## Quick version
 
