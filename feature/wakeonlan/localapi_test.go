@@ -76,21 +76,22 @@ func newTestNodeBackend() *fakeNodeBackend {
 func TestResolveTargetMACs(t *testing.T) {
 	nb := newTestNodeBackend()
 	tests := []struct {
+		name    string
 		target  string
 		want    []string
 		wantErr bool
 	}{
-		{target: "AA-BB-CC-00-11-22", want: []string{"aa:bb:cc:00:11:22"}},
-		{target: "desktop", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
-		{target: "DESKTOP.example.ts.net", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
-		{target: "100.64.0.2", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
-		{target: "nas", wantErr: true},     // no advertised MACs
-		{target: "printer", wantErr: true}, // unknown device
-		{target: "100.64.9.9", wantErr: true},
-		{target: "", wantErr: true},
+		{name: "mac", target: "AA-BB-CC-00-11-22", want: []string{"aa:bb:cc:00:11:22"}},
+		{name: "short_name", target: "desktop", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
+		{name: "magicdns_name", target: "DESKTOP.example.ts.net", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
+		{name: "tailscale_ip", target: "100.64.0.2", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
+		{name: "no_macs", target: "nas", wantErr: true},            // no advertised MACs
+		{name: "unknown_device", target: "printer", wantErr: true}, // unknown device
+		{name: "unknown_ip", target: "100.64.9.9", wantErr: true},
+		{name: "empty", target: "", wantErr: true},
 	}
 	for _, tt := range tests {
-		t.Run(tt.target, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			macs, err := resolveTargetMACs(nb, tt.target)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)

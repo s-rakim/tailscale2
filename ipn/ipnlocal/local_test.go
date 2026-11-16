@@ -38,6 +38,7 @@ import (
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/feature"
 	_ "tailscale.com/feature/condregister/portmapper"
+	_ "tailscale.com/feature/guivisibility"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -2190,6 +2191,87 @@ func TestWatchNotificationsClosesSlowConsumer(t *testing.T) {
 	}
 }
 
+func TestWatchNotificationsSuspendsSlowConsumer(t *testing.T) {
+	b := newTestLocalBackend(t)
+	ctx := t.Context()
+
+	watchAdded := make(chan struct{})
+	releaseFirstNotify := make(chan struct{})
+	got := make(chan *ipn.Notify, 256)
+
+	go func() {
+		first := true
+		b.WatchNotificationsAs(ctx, nil, ipn.NotifyInitialState|ipn.NotifySuspendWhenBehind, func() { close(watchAdded) }, func(n *ipn.Notify) bool {
+			if first {
+				first = false
+				<-releaseFirstNotify
+			}
+			got <- n
+			return true
+		})
+	}()
+	<-watchAdded
+
+	next := func() *ipn.Notify {
+		t.Helper()
+		select {
+		case n := <-got:
+			return n
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for notification")
+			return nil
+		}
+	}
+	numWatchers := func() int {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return len(b.notifyWatchers)
+	}
+
+	// The watcher's callback is blocked on the initial notification. Fill
+	// the 128-slot queue, then send one more notification to force overflow.
+	running := ipn.Running
+	for range 129 {
+		b.send(ipn.Notify{State: &running})
+	}
+	close(releaseFirstNotify)
+
+	ini := next()
+	if ini.SessionID == "" || ini.State == nil {
+		t.Fatalf("initial notification = %v; want SessionID and State", ini)
+	}
+	var n *ipn.Notify
+	for n = next(); !n.Suspended; n = next() {
+		if n.State == nil || *n.State != ipn.Running {
+			t.Fatalf("got %v before suspension; want Running state", n)
+		}
+	}
+	if got := numWatchers(); got != 1 {
+		t.Fatalf("watchers after suspension = %d; want 1", got)
+	}
+
+	// Nothing is delivered while suspended. Resuming re-delivers the
+	// initial notification and then new notifications.
+	stopped := ipn.Stopped
+	b.send(ipn.Notify{State: &stopped})
+	if err := b.ResumeWatchNotifications(ctx, "bogus"); err == nil {
+		t.Fatal("ResumeWatchNotifications(bogus) succeeded; want error")
+	}
+	if err := b.ResumeWatchNotifications(ctx, ini.SessionID); err != nil {
+		t.Fatalf("ResumeWatchNotifications: %v", err)
+	}
+	if n := next(); n.Suspended || n.SessionID != ini.SessionID || n.State == nil || *n.State != *ini.State {
+		t.Fatalf("after resume got %v; want initial notification", n)
+	}
+	b.send(ipn.Notify{State: &stopped})
+	if n := next(); n.State == nil || *n.State != ipn.Stopped {
+		t.Fatalf("after resume got %v; want Stopped state", n)
+	}
+	if got := numWatchers(); got != 1 {
+		t.Fatalf("watchers after resume = %d; want 1", got)
+	}
+}
+
 func TestWatchNotificationsInProcessNoDisconnectBlocksSender(t *testing.T) {
 	b := newTestLocalBackend(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2619,6 +2701,247 @@ func TestSetControlClientStatusSendsFullNetmapAsPeerChanges(t *testing.T) {
 	}
 	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm, LoggedIn: true})
 	nw.check()
+}
+
+// TestExitNodeIPResolvedOnDeltaUpsert checks that an exit node selected by
+// IP before it was in the netmap is resolved to a node ID when the node
+// arrives as a delta upsert, not only on the next full netmap.
+//
+// See https://github.com/tailscale/tailscale/issues/22012.
+func TestExitNodeIPResolvedOnDeltaUpsert(t *testing.T) {
+	self := makePeer(1, withName("self"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.1/32")))
+	exitNode := makeExitNode(2, withName("exit"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.2/32")))
+	other := makePeer(10, withName("other"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.10/32")))
+
+	b := newTestLocalBackend(t)
+	b.ForTest().SetPrefs(&ipn.Prefs{
+		ControlURL: "https://localhost:1/",
+		ExitNodeIP: exitNode.Addresses().At(0).Addr(),
+	})
+
+	// A full netmap that does not contain the exit node leaves the IP unresolved.
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: buildNetmapWithPeers(self, other), LoggedIn: true})
+	if p := b.Prefs(); p.ExitNodeID() != "" || !p.ExitNodeIP().IsValid() {
+		t.Fatalf("after netmap without exit node: ExitNodeID=%q ExitNodeIP=%v; want unresolved", p.ExitNodeID(), p.ExitNodeIP())
+	}
+
+	// A peer that is not the exit node does not resolve it.
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: makePeer(11, withAddresses(netip.MustParsePrefix("100.64.1.11/32")))}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if p := b.Prefs(); p.ExitNodeID() != "" || !p.ExitNodeIP().IsValid() {
+		t.Fatalf("after unrelated upsert: ExitNodeID=%q ExitNodeIP=%v; want unresolved", p.ExitNodeID(), p.ExitNodeIP())
+	}
+
+	// The exit node arrives by delta and is resolved. Watchers must learn
+	// about the peer and the prefs that select it in the same notification.
+	nw := newNotificationWatcher(t, b, ipnauth.Self)
+	nw.watch(ipn.NotifyPeerChanges|ipn.NotifyNoNetMap, []wantedNotification{{
+		name: "exit node peer change with prefs selecting it",
+		cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			hasPeer := slices.ContainsFunc(n.PeersChanged, func(p *tailcfg.Node) bool { return p.ID == exitNode.ID() })
+			hasPrefs := n.Prefs != nil && n.Prefs.Valid() && n.Prefs.ExitNodeID() == exitNode.StableID()
+			return hasPeer && hasPrefs
+		},
+	}})
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: exitNode}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	nw.check()
+	p := b.Prefs()
+	if p.ExitNodeID() != exitNode.StableID() {
+		t.Errorf("after delta upsert: ExitNodeID = %q, want %q", p.ExitNodeID(), exitNode.StableID())
+	}
+	if p.ExitNodeIP().IsValid() {
+		t.Errorf("after delta upsert: ExitNodeIP = %v, want cleared", p.ExitNodeIP())
+	}
+	if got := b.hostinfo.ExitNodeID; got != exitNode.StableID() {
+		t.Errorf("after delta upsert: hostinfo.ExitNodeID = %q, want %q", got, exitNode.StableID())
+	}
+}
+
+// TestAutoExitNodeResolvedOnDeltaUpsert checks that an auto exit node that
+// could not be resolved, because no exit node was in the netmap, is selected
+// when the first exit node arrives as a delta upsert.
+func TestAutoExitNodeResolvedOnDeltaUpsert(t *testing.T) {
+	self := makePeer(1, withName("self"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.1/32")))
+	exitNode := makeExitNode(2, withName("exit"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.2/32")))
+	other := makePeer(10, withName("other"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.10/32")))
+
+	b := newTestLocalBackend(t)
+	b.ForTest().SetPrefs(&ipn.Prefs{
+		ControlURL:   "https://localhost:1/",
+		AutoExitNode: ipn.AnyExitNode,
+	})
+
+	nm := buildNetmapWithPeers(self, other)
+	b.MagicConn().AddNetcheckReportForTest(nm.DERPMap, &netcheck.Report{
+		RegionLatency: map[tailcfg.DERPRegionID]time.Duration{1: 5 * time.Millisecond},
+		PreferredDERP: 1,
+	}, time.Now())
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm, LoggedIn: true})
+	if p := b.Prefs(); p.ExitNodeID() != ipn.UnresolvedExitNodeID {
+		t.Fatalf("after netmap without exit nodes: ExitNodeID=%q; want %q", p.ExitNodeID(), ipn.UnresolvedExitNodeID)
+	}
+
+	// A peer that is not an exit node leaves the blackhole in place.
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: makePeer(11, withAddresses(netip.MustParsePrefix("100.64.1.11/32")))}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if p := b.Prefs(); p.ExitNodeID() != ipn.UnresolvedExitNodeID {
+		t.Fatalf("after unrelated upsert: ExitNodeID=%q; want %q", p.ExitNodeID(), ipn.UnresolvedExitNodeID)
+	}
+
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: exitNode}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if p := b.Prefs(); p.ExitNodeID() != exitNode.StableID() {
+		t.Errorf("after delta upsert: ExitNodeID = %q, want %q", p.ExitNodeID(), exitNode.StableID())
+	}
+	if got := b.hostinfo.ExitNodeID; got != exitNode.StableID() {
+		t.Errorf("after delta upsert: hostinfo.ExitNodeID = %q, want %q", got, exitNode.StableID())
+	}
+}
+
+// TestAutoExitNodeResolvedOnDeltaOnline checks that an auto exit node that
+// could not be resolved, because every exit node in the netmap was offline,
+// is selected when an exit node comes online by delta patch.
+func TestAutoExitNodeResolvedOnDeltaOnline(t *testing.T) {
+	self := makePeer(1, withName("self"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.1/32")))
+	exitNode := makeExitNode(2, withName("exit"), withDERP(1), withOnline(false), withAddresses(netip.MustParsePrefix("100.64.1.2/32")))
+
+	b := newTestLocalBackend(t)
+	b.ForTest().SetPrefs(&ipn.Prefs{
+		ControlURL:   "https://localhost:1/",
+		AutoExitNode: ipn.AnyExitNode,
+	})
+
+	nm := buildNetmapWithPeers(self, exitNode)
+	b.MagicConn().AddNetcheckReportForTest(nm.DERPMap, &netcheck.Report{
+		RegionLatency: map[tailcfg.DERPRegionID]time.Duration{1: 5 * time.Millisecond},
+		PreferredDERP: 1,
+	}, time.Now())
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm, LoggedIn: true})
+	if p := b.Prefs(); p.ExitNodeID() != ipn.UnresolvedExitNodeID {
+		t.Fatalf("after netmap with only an offline exit node: ExitNodeID=%q; want %q", p.ExitNodeID(), ipn.UnresolvedExitNodeID)
+	}
+
+	muts, ok := netmap.MutationsFromMapResponse(&tailcfg.MapResponse{
+		PeersChangedPatch: []*tailcfg.PeerChange{{NodeID: exitNode.ID(), Online: new(true)}},
+	}, time.Now())
+	if !ok {
+		t.Fatal("MutationsFromMapResponse failed")
+	}
+	if !b.UpdateNetmapDelta(muts) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if p := b.Prefs(); p.ExitNodeID() != exitNode.StableID() {
+		t.Errorf("after online patch: ExitNodeID = %q, want %q", p.ExitNodeID(), exitNode.StableID())
+	}
+	if got := b.hostinfo.ExitNodeID; got != exitNode.StableID() {
+		t.Errorf("after online patch: hostinfo.ExitNodeID = %q, want %q", got, exitNode.StableID())
+	}
+}
+
+// TestAutoExitNodeReselectedOnDeltaRemove checks that an auto exit node is
+// reselected when the selected exit node is removed by delta.
+func TestAutoExitNodeReselectedOnDeltaRemove(t *testing.T) {
+	self := makePeer(1, withName("self"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.1/32")))
+	// Both exit nodes are in the preferred region, so the previous suggestion
+	// is kept while it exists.
+	exitNode2 := makeExitNode(2, withName("exit2"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.2/32")))
+	exitNode3 := makeExitNode(3, withName("exit3"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.3/32")))
+
+	b := newTestLocalBackend(t)
+	b.ForTest().SetPrefs(&ipn.Prefs{
+		ControlURL:   "https://localhost:1/",
+		AutoExitNode: ipn.AnyExitNode,
+	})
+
+	nm := buildNetmapWithPeers(self, exitNode2, exitNode3)
+	b.MagicConn().AddNetcheckReportForTest(nm.DERPMap, &netcheck.Report{
+		RegionLatency: map[tailcfg.DERPRegionID]time.Duration{1: 5 * time.Millisecond},
+		PreferredDERP: 1,
+	}, time.Now())
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm, LoggedIn: true})
+	selected := b.Prefs().ExitNodeID()
+	if selected != exitNode2.StableID() && selected != exitNode3.StableID() {
+		t.Fatalf("after netmap: ExitNodeID=%q; want one of the exit nodes", selected)
+	}
+	removed, remaining := exitNode2, exitNode3
+	if selected == exitNode3.StableID() {
+		removed, remaining = exitNode3, exitNode2
+	}
+
+	// Removing the other exit node leaves the selection alone.
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.MakeNodeMutationRemove(remaining.ID())}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if got := b.Prefs().ExitNodeID(); got != selected {
+		t.Fatalf("after removing the other exit node: ExitNodeID=%q; want %q", got, selected)
+	}
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: remaining}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+
+	// Removing the selected exit node switches to the remaining one.
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.MakeNodeMutationRemove(removed.ID())}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if got := b.Prefs().ExitNodeID(); got != remaining.StableID() {
+		t.Errorf("after removing the selected exit node: ExitNodeID=%q; want %q", got, remaining.StableID())
+	}
+	if got := b.hostinfo.ExitNodeID; got != remaining.StableID() {
+		t.Errorf("after removing the selected exit node: hostinfo.ExitNodeID = %q, want %q", got, remaining.StableID())
+	}
+}
+
+// TestAutoExitNodeReselectedOnDeltaUpsertOffline checks that an auto exit
+// node is reselected when an upsert of the selected exit node marks it
+// offline.
+func TestAutoExitNodeReselectedOnDeltaUpsertOffline(t *testing.T) {
+	self := makePeer(1, withName("self"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.1/32")))
+	exitNode2 := makeExitNode(2, withName("exit2"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.2/32")))
+	exitNode3 := makeExitNode(3, withName("exit3"), withDERP(1), withAddresses(netip.MustParsePrefix("100.64.1.3/32")))
+
+	b := newTestLocalBackend(t)
+	b.ForTest().SetPrefs(&ipn.Prefs{
+		ControlURL:   "https://localhost:1/",
+		AutoExitNode: ipn.AnyExitNode,
+	})
+
+	nm := buildNetmapWithPeers(self, exitNode2, exitNode3)
+	b.MagicConn().AddNetcheckReportForTest(nm.DERPMap, &netcheck.Report{
+		RegionLatency: map[tailcfg.DERPRegionID]time.Duration{1: 5 * time.Millisecond},
+		PreferredDERP: 1,
+	}, time.Now())
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm, LoggedIn: true})
+	selected := b.Prefs().ExitNodeID()
+	if selected != exitNode2.StableID() && selected != exitNode3.StableID() {
+		t.Fatalf("after netmap: ExitNodeID=%q; want one of the exit nodes", selected)
+	}
+	selectedNode, other := exitNode2, exitNode3
+	if selected == exitNode3.StableID() {
+		selectedNode, other = exitNode3, exitNode2
+	}
+
+	// An upsert of the other exit node leaves the selection alone.
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: other}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if got := b.Prefs().ExitNodeID(); got != selected {
+		t.Fatalf("after upsert of the other exit node: ExitNodeID=%q; want %q", got, selected)
+	}
+
+	// An upsert that marks the selected exit node offline switches away from it.
+	offline := selectedNode.AsStruct()
+	offline.Online = new(false)
+	if !b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: offline.View()}}) {
+		t.Fatal("UpdateNetmapDelta returned false")
+	}
+	if got := b.Prefs().ExitNodeID(); got != other.StableID() {
+		t.Errorf("after upsert marking the selected exit node offline: ExitNodeID=%q; want %q", got, other.StableID())
+	}
 }
 
 // sendFullNetmap delivers a full netmap from control, as after a
@@ -3759,13 +4082,38 @@ func TestReconfigureAppConnector(t *testing.T) {
 		t.Fatal("expected app connector")
 	}
 
+	conn25Cfg := `{
+		"name": "example",
+		"domains": ["example.com"],
+		"connectors": ["tag:example"],
+		"mode": "magicip"
+	}`
+
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			Tags: []string{"tag:example"},
+			CapMap: (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+				"tailscale.com/app-connectors": {tailcfg.RawMessage(conn25Cfg)},
+			}),
+		}).View(),
+	}
+
+	b.currentNode().SetNetMap(nm)
+
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
+	b.appConnector.Wait(context.Background())
+	if b.appConnector.Domains().Len() != 0 {
+		t.Fatalf("expected no configured domains conn25 app")
+	}
+
 	appCfg := `{
 		"name": "example",
 		"domains": ["example.com"],
 		"connectors": ["tag:example"]
 	}`
 
-	nm := &netmap.NetworkMap{
+	nm = &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
 			Name: "example.ts.net",
 			Tags: []string{"tag:example"},
@@ -4784,6 +5132,53 @@ func TestApplySysPolicy(t *testing.T) {
 			wantAnyChange: true,
 			stringPolicies: map[pkey.Key]string{
 				pkey.ControlURL: "set",
+			},
+		},
+		{
+			name: "Tailnet",
+			wantPrefs: ipn.Prefs{
+				Tailnet: "required:tn123",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "required:tn123",
+			},
+		},
+		{
+			// The value is passed through verbatim, including a comma-separated
+			// list and a single leading "required:" prefix governing the set.
+			name: "Tailnet-comma-separated-required",
+			wantPrefs: ipn.Prefs{
+				Tailnet: "required:tn123,tn456",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "required:tn123,tn456",
+			},
+		},
+		{
+			// A comma-separated list without the prefix is a recommendation
+			// over the set, again passed through unchanged.
+			name: "Tailnet-comma-separated-recommended",
+			wantPrefs: ipn.Prefs{
+				Tailnet: "tn123,tn456",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "tn123,tn456",
+			},
+		},
+		{
+			name: "Tailnet-overrides-prefs",
+			prefs: ipn.Prefs{
+				Tailnet: "tn123",
+			},
+			wantPrefs: ipn.Prefs{
+				Tailnet: "required:tn456",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "required:tn456",
 			},
 		},
 		{
@@ -8896,7 +9291,7 @@ func TestOnClientVersionRespectsAutoUpdateCheck(t *testing.T) {
 
 	nw := newNotificationWatcher(t, lb, ipnauth.Self)
 	nw.watch(0, nil, unexpectedClientVersion)
-	lb.onClientVersion(cv)
+	lb.onClientVersion(*cv)
 	nw.check()
 
 	// Verify it was cached despite not being broadcast.
@@ -8915,7 +9310,7 @@ func TestOnClientVersionRespectsAutoUpdateCheck(t *testing.T) {
 	nw.watch(0, []wantedNotification{
 		wantClientVersionNotify("1.96.0"),
 	})
-	lb.onClientVersion(cv)
+	lb.onClientVersion(*cv)
 	nw.check()
 }
 
@@ -9038,6 +9433,54 @@ func TestPolicyChangeNotifiesWatcher(t *testing.T) {
 	store.SetStrings(source.TestSettingOf(pkey.AdminConsoleVisibility, "hide"))
 
 	nw.check()
+}
+
+func TestSysPolicyChangeSuspendsSlowConsumer(t *testing.T) {
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	b := newTestLocalBackendWithSys(t, sys)
+
+	sess := &watchSession{
+		sessionID: "test-session",
+		ctx:       t.Context(),
+		mask:      ipn.NotifySysPolicyChanges | ipn.NotifySuspendWhenBehind,
+		ch:        make(chan *ipn.Notify, 1),
+	}
+
+	func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		if b.notifyWatchers == nil {
+			b.notifyWatchers = make(map[string]*watchSession)
+		}
+		b.notifyWatchers[sess.sessionID] = sess
+	}()
+
+	sess.ch <- &ipn.Notify{} // sess.ch is 1-buffered; fill it before sending the policy changed notification
+
+	b.sysPolicyChangedForSession(sess) // shouldn't block
+
+	b.mu.Lock()
+	suspended := sess.suspended
+	numWatchers := len(b.notifyWatchers)
+	b.mu.Unlock()
+
+	if !suspended {
+		t.Error("watcher was not suspended after policy notification")
+	}
+	if numWatchers != 1 {
+		t.Errorf("watchers after suspension = %d; want 1", numWatchers)
+	}
+
+	select {
+	case n := <-sess.ch:
+		if n == nil || !n.Suspended {
+			t.Errorf("notification = %v; want Suspended", n)
+		}
+	default:
+		t.Fatal("no suspension notification received")
+	}
 }
 
 func TestPolicyNotifyPerUser(t *testing.T) {
@@ -9174,7 +9617,7 @@ func TestHiddenNetworkDevicesNotifyPerUser(t *testing.T) {
 	userStoreA.SetStringLists(
 		source.TestSettingOf(
 			pkey.HiddenNetworkDevices,
-			[]string{hiddenNetworkDevicesOtherUsers},
+			[]string{"other-users"},
 		),
 	)
 	rsop.RegisterStoreForTest(t, "UserStoreA", setting.UserScopeOf(uidA), userStoreA)
@@ -9185,6 +9628,7 @@ func TestHiddenNetworkDevicesNotifyPerUser(t *testing.T) {
 	sys := tsd.NewSystem()
 	sys.PolicyClient.Set(testPolicyClient{})
 	lb := newTestLocalBackendWithSys(t, sys)
+	lb.extHost.Init()
 
 	lb.currentNode().SetNetMap(&netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
@@ -9208,16 +9652,11 @@ func TestHiddenNetworkDevicesNotifyPerUser(t *testing.T) {
 		return wantedNotification{
 			name: fmt.Sprintf("NodeGUIVisibility-hidden=%v", wantHidden),
 			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
-				if n.NodeGUIVisibility == nil {
+				if n.Policy == nil {
 					return false
 				}
 
-				got, ok := n.NodeGUIVisibility["peer-10"]
-				if !ok {
-					t.Errorf("NodeGUIVisibility missing peer-10")
-					return true
-				}
-
+				got := n.NodeGUIVisibility["peer-10"]
 				if got.HideInGUI != wantHidden {
 					t.Errorf(
 						"NodeGUIVisibility[peer-10].HideInGUI = %v; want %v",
@@ -9253,14 +9692,13 @@ func TestHiddenNetworkDevicesPolicyChangeUpdatesVisibility(t *testing.T) {
 	)
 
 	uid := "S-1-5-21-1001"
-
 	userStore := source.NewTestStore(t)
 	rsop.RegisterStoreForTest(t, "UserStore", setting.UserScopeOf(uid), userStore)
 
 	sys := tsd.NewSystem()
 	sys.PolicyClient.Set(testPolicyClient{})
 	lb := newTestLocalBackendWithSys(t, sys)
-
+	lb.extHost.Init()
 	lb.currentNode().SetNetMap(&netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
 			ID:       1,
@@ -9278,30 +9716,25 @@ func TestHiddenNetworkDevicesPolicyChangeUpdatesVisibility(t *testing.T) {
 
 	actor := &ipnauth.TestActor{UID: ipn.WindowsUserID(uid)}
 	nw := newNotificationWatcher(t, lb, actor)
-
 	nw.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
 		{
 			name: "initially visible",
 			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
-				if n.NodeGUIVisibility == nil {
+				if n.Policy == nil {
 					return false
 				}
-				got, ok := n.NodeGUIVisibility["peer-10"]
-				return ok && !got.HideInGUI
+				if len(n.NodeGUIVisibility) != 0 {
+					t.Errorf("NodeGUIVisibility = %v; want empty", n.NodeGUIVisibility)
+				}
+				return true
 			},
 		},
 		{
 			name: "hidden after policy change",
 			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
-				if n.NodeGUIVisibility == nil {
+				if n.Policy == nil || !n.NodeGUIVisibility["peer-10"].HideInGUI {
 					return false
 				}
-
-				got, ok := n.NodeGUIVisibility["peer-10"]
-				if !ok || !got.HideInGUI {
-					return false
-				}
-
 				if len(n.PeersChanged) != 0 {
 					t.Errorf("PeersChanged = %v; want none", n.PeersChanged)
 				}
@@ -9311,7 +9744,6 @@ func TestHiddenNetworkDevicesPolicyChangeUpdatesVisibility(t *testing.T) {
 				if len(n.PeerChangedPatch) != 0 {
 					t.Errorf("PeerChangedPatch = %v; want none", n.PeerChangedPatch)
 				}
-
 				return true
 			},
 		},
@@ -9320,9 +9752,199 @@ func TestHiddenNetworkDevicesPolicyChangeUpdatesVisibility(t *testing.T) {
 	userStore.SetStringLists(
 		source.TestSettingOf(
 			pkey.HiddenNetworkDevices,
-			[]string{hiddenNetworkDevicesOtherUsers},
+			[]string{"other-users"},
 		),
 	)
+
+	nw.check()
+}
+
+func TestHiddenNetworkDevicesPolicyRemovalUpdatesVisibility(t *testing.T) {
+	setting.SetDefinitionsForTest(t,
+		setting.NewDefinition(
+			pkey.HiddenNetworkDevices,
+			setting.UserSetting,
+			setting.StringListValue,
+		),
+	)
+
+	uid := "S-1-5-21-1001"
+	userStore := source.NewTestStore(t)
+	userStore.SetStringLists(
+		source.TestSettingOf(
+			pkey.HiddenNetworkDevices,
+			[]string{"other-users"},
+		),
+	)
+	rsop.RegisterStoreForTest(t, "UserStore", setting.UserScopeOf(uid), userStore)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	lb := newTestLocalBackendWithSys(t, sys)
+	lb.extHost.Init()
+	lb.currentNode().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			ID:       1,
+			StableID: "self",
+			User:     1,
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				ID:       10,
+				StableID: "peer-10",
+				User:     2,
+			}).View(),
+		},
+	})
+
+	actor := &ipnauth.TestActor{UID: ipn.WindowsUserID(uid)}
+	nw := newNotificationWatcher(t, lb, actor)
+	nw.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
+		{
+			name: "initially hidden",
+			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+				if n.Policy == nil {
+					return false
+				}
+				if !n.NodeGUIVisibility["peer-10"].HideInGUI {
+					t.Errorf("NodeGUIVisibility = %v; want peer-10 hidden", n.NodeGUIVisibility)
+				}
+				return true
+			},
+		},
+		{
+			name: "visible after policy removal",
+			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+				if n.Policy == nil {
+					return false
+				}
+				if len(n.NodeGUIVisibility) != 0 {
+					t.Errorf("NodeGUIVisibility = %v; want empty", n.NodeGUIVisibility)
+				}
+				if len(n.PeersChanged) != 0 {
+					t.Errorf("PeersChanged = %v; want none", n.PeersChanged)
+				}
+				if len(n.PeersRemoved) != 0 {
+					t.Errorf("PeersRemoved = %v; want none", n.PeersRemoved)
+				}
+				if len(n.PeerChangedPatch) != 0 {
+					t.Errorf("PeerChangedPatch = %v; want none", n.PeerChangedPatch)
+				}
+				return true
+			},
+		},
+	})
+
+	userStore.SetStringLists(
+		source.TestSettingOf(
+			pkey.HiddenNetworkDevices,
+			[]string{},
+		),
+	)
+
+	nw.check()
+}
+
+func TestHiddenNetworkDevicesIncrementalPeerUpdates(t *testing.T) {
+	setting.SetDefinitionsForTest(t,
+		setting.NewDefinition(
+			pkey.HiddenNetworkDevices,
+			setting.UserSetting,
+			setting.StringListValue,
+		),
+	)
+
+	uid := "S-1-5-21-1001"
+	userStore := source.NewTestStore(t)
+	userStore.SetStringLists(
+		source.TestSettingOf(
+			pkey.HiddenNetworkDevices,
+			[]string{"other-users"},
+		),
+	)
+	rsop.RegisterStoreForTest(t, "UserStore", setting.UserScopeOf(uid), userStore)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	lb := newTestLocalBackendWithSys(t, sys)
+	lb.extHost.Init()
+
+	lb.currentNode().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			ID:       1,
+			StableID: "self",
+			User:     1,
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				ID:       10,
+				StableID: "peer-10",
+				User:     2,
+			}).View(),
+		},
+	})
+
+	// wantVisibility matches a peer-change notification and checks that
+	// its NodeGUIVisibility hides exactly the given peers.
+	wantVisibility := func(name string, hidden ...tailcfg.StableNodeID) wantedNotification {
+		return wantedNotification{
+			name: name,
+			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+				if len(n.PeersChanged) == 0 && len(n.PeersRemoved) == 0 {
+					return false
+				}
+				want := make(map[tailcfg.StableNodeID]ipn.NodeGUIVisibility)
+				for _, id := range hidden {
+					want[id] = ipn.NodeGUIVisibility{HideInGUI: true}
+				}
+				if got := n.NodeGUIVisibility; !maps.Equal(got, want) {
+					t.Errorf("%s: NodeGUIVisibility = %v; want %v", name, got, want)
+				}
+				return true
+			},
+		}
+	}
+
+	actor := &ipnauth.TestActor{UID: ipn.WindowsUserID(uid)}
+	nw := newNotificationWatcher(t, lb, actor)
+	nw.watch(ipn.NotifySysPolicyChanges|ipn.NotifyPeerChanges, []wantedNotification{
+		{
+			name: "initial visibility snapshot",
+			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+				if n.Policy == nil {
+					return false
+				}
+				if len(n.NodeGUIVisibility) != 1 || !n.NodeGUIVisibility["peer-10"].HideInGUI {
+					t.Errorf("unexpected initial visibility: %v", n.NodeGUIVisibility)
+				}
+				return true
+			},
+		},
+		wantVisibility("hidden peer added", "peer-20"),
+		wantVisibility("hidden peer becomes visible"),
+		wantVisibility("hidden peer removed"),
+	}, func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+		if n.NodeGUIVisibility != nil {
+			t.Errorf("unexpected visibility update: %v", n.NodeGUIVisibility)
+		}
+		return false
+	})
+
+	lb.SendNotify(ipn.Notify{
+		PeersChanged: []*tailcfg.Node{
+			{ID: 20, StableID: "peer-20", User: 2},
+		},
+	})
+
+	lb.SendNotify(ipn.Notify{
+		PeersChanged: []*tailcfg.Node{
+			{ID: 20, StableID: "peer-20", User: 1},
+		},
+	})
+
+	lb.SendNotify(ipn.Notify{
+		PeersRemoved: []tailcfg.NodeID{10},
+	})
 
 	nw.check()
 }

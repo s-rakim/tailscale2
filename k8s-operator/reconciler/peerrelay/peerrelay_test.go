@@ -14,7 +14,6 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 
 	"go.uber.org/zap"
@@ -25,8 +24,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	tailscaleclient "tailscale.com/client/tailscale/v2"
@@ -34,7 +31,8 @@ import (
 	"tailscale.com/ipn"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/k8s-operator/reconciler/peerrelay"
-	"tailscale.com/k8s-operator/tsclient"
+	"tailscale.com/k8s-operator/reconciler/reconcilertest"
+	"tailscale.com/types/key"
 )
 
 const (
@@ -1032,6 +1030,21 @@ func TestReconciler_Reconcile(t *testing.T) {
 			ExpectedReadyReason:   peerrelay.ReasonAWSConfigInvalid,
 		},
 		{
+			// Nothing is created until the ProxyClass is ready.
+			Name:    "proxyclass-not-ready-blocks-reconcile",
+			Request: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
+			PeerRelay: &tsapi.PeerRelay{
+				ObjectMeta: metav1.ObjectMeta{Name: "test"},
+				Spec:       tsapi.PeerRelaySpec{ProxyClass: "custom"},
+			},
+			ExistingResources: []client.Object{
+				&tsapi.ProxyClass{ObjectMeta: metav1.ObjectMeta{Name: "custom"}},
+			},
+			ExpectStatefulSetGone: true,
+			ExpectedReadyStatus:   metav1.ConditionFalse,
+			ExpectedReadyReason:   peerrelay.ReasonProxyClassNotReady,
+		},
+		{
 			Name:    "deletion",
 			Request: reconcile.Request{NamespacedName: types.NamespacedName{Name: "test"}},
 			PeerRelay: &tsapi.PeerRelay{
@@ -1063,10 +1076,9 @@ func TestReconciler_Reconcile(t *testing.T) {
 
 	for _, tc := range tt {
 		t.Run(tc.Name, func(t *testing.T) {
-			builder := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-				WithScheme(tsapi.GlobalScheme).
+			builder := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 				WithStatusSubresource(&tsapi.PeerRelay{}, &appsv1.StatefulSet{}).
-				WithInterceptorFuncs(applyPatchInterceptor())
+				WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor())
 			if tc.PeerRelay != nil {
 				builder = builder.WithObjects(tc.PeerRelay)
 			}
@@ -1078,7 +1090,7 @@ func TestReconciler_Reconcile(t *testing.T) {
 				TailscaleNamespace: tailscaleNamespace,
 				ProxyImage:         testProxyImage,
 				DefaultTags:        []string{"tag:test-peer-relay"},
-				Clients:            &fakeClientProvider{client: &fakeTSClient{}},
+				Clients:            reconcilertest.NewFakeClientProvider(reconcilertest.NewFakeClient()),
 				Resolver:           testResolver,
 				Logger:             logger.Sugar(),
 			})
@@ -1148,7 +1160,7 @@ func TestReconciler_Reconcile(t *testing.T) {
 			}
 
 			if tc.ExpectedReadyStatus != "" || tc.ExpectedReadyReason != "" {
-				cond := readyCondition(&pr)
+				cond := reconcilertest.Condition(t, pr.Status.Conditions, tsapi.PeerRelayReady)
 				if tc.ExpectedReadyStatus != "" && cond.Status != tc.ExpectedReadyStatus {
 					t.Errorf("expected PeerRelayReady status %s, got %q", tc.ExpectedReadyStatus, cond.Status)
 				}
@@ -1291,16 +1303,6 @@ func assertSecretsForType(t *testing.T, fc client.Client, prName, secretType, la
 	if !slices.Equal(got, sortedWant) {
 		t.Errorf("expected %s %v, got %v", label, sortedWant, got)
 	}
-}
-
-func readyCondition(pr *tsapi.PeerRelay) metav1.Condition {
-	for _, cond := range pr.Status.Conditions {
-		if cond.Type == string(tsapi.PeerRelayReady) {
-			return cond
-		}
-	}
-
-	return metav1.Condition{}
 }
 
 func assertService(t *testing.T, want expectedService, got *corev1.Service) {
@@ -1454,8 +1456,7 @@ func TestReconciler_TailscaledConfig(t *testing.T) {
 		Spec:       tsapi.PeerRelaySpec{Replicas: new(int32(2))},
 	}
 
-	fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-		WithScheme(tsapi.GlobalScheme).
+	fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 		WithStatusSubresource(&tsapi.PeerRelay{}).
 		WithObjects(
 			pr,
@@ -1470,7 +1471,7 @@ func TestReconciler_TailscaledConfig(t *testing.T) {
 		TailscaleNamespace: tailscaleNamespace,
 		ProxyImage:         testProxyImage,
 		DefaultTags:        []string{"tag:test-peer-relay"},
-		Clients:            &fakeClientProvider{client: &fakeTSClient{loginURL: testLoginURL}},
+		Clients:            reconcilertest.NewFakeClientProvider(reconcilertest.NewFakeClient(reconcilertest.WithLoginURL(testLoginURL))),
 		Resolver:           testResolver,
 		Logger:             logger.Sugar(),
 	})
@@ -1534,100 +1535,6 @@ func readTailscaledConfig(t *testing.T, fc client.Client, secretName string) ipn
 	return conf
 }
 
-func applyPatchInterceptor() interceptor.Funcs {
-	return interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() != types.ApplyPatchType {
-				return cl.Patch(ctx, obj, patch, opts...)
-			}
-
-			key := client.ObjectKeyFromObject(obj)
-			existing := obj.DeepCopyObject().(client.Object)
-			if err := cl.Get(ctx, key, existing); err != nil {
-				if !apierrors.IsNotFound(err) {
-					return err
-				}
-
-				return cl.Create(ctx, obj)
-			}
-
-			obj.SetResourceVersion(existing.GetResourceVersion())
-			return cl.Update(ctx, obj)
-		},
-	}
-}
-
-type fakeClientProvider struct {
-	client tsclient.Client
-	err    error
-}
-
-func (p *fakeClientProvider) For(_ string) (tsclient.Client, error) { return p.client, p.err }
-
-type fakeTSClient struct {
-	tsclient.Client
-
-	loginURL string
-
-	mu            sync.Mutex
-	keyCalls      []tailscaleclient.CreateKeyRequest
-	deviceDeletes []string
-	nextKey       []string
-}
-
-func (c *fakeTSClient) Keys() tsclient.KeyResource       { return (*fakeKeys)(c) }
-func (c *fakeTSClient) Devices() tsclient.DeviceResource { return (*fakeDevices)(c) }
-func (c *fakeTSClient) LoginURL() string                 { return c.loginURL }
-
-func (c *fakeTSClient) CreateAuthKeyCalls() []tailscaleclient.CreateKeyRequest {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return slices.Clone(c.keyCalls)
-}
-
-func (c *fakeTSClient) DeviceDeletes() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return slices.Clone(c.deviceDeletes)
-}
-
-type fakeKeys fakeTSClient
-
-func (k *fakeKeys) CreateAuthKey(_ context.Context, req tailscaleclient.CreateKeyRequest) (*tailscaleclient.Key, error) {
-	c := (*fakeTSClient)(k)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.keyCalls = append(c.keyCalls, req)
-
-	var key string
-	if len(c.nextKey) > 0 {
-		key, c.nextKey = c.nextKey[0], c.nextKey[1:]
-	} else {
-		key = fmt.Sprintf("auth-key-%d", len(c.keyCalls))
-	}
-	return &tailscaleclient.Key{Key: key}, nil
-}
-
-func (k *fakeKeys) List(_ context.Context, _ bool) ([]tailscaleclient.Key, error) { return nil, nil }
-
-type fakeDevices fakeTSClient
-
-func (d *fakeDevices) Delete(_ context.Context, id string) error {
-	c := (*fakeTSClient)(d)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.deviceDeletes = append(c.deviceDeletes, id)
-	return nil
-}
-
-func (d *fakeDevices) List(_ context.Context, _ ...tailscaleclient.ListDevicesOptions) ([]tailscaleclient.Device, error) {
-	return nil, nil
-}
-
-func (d *fakeDevices) Get(_ context.Context, _ string) (*tailscaleclient.Device, error) {
-	return nil, nil
-}
-
 func TestReconciler_AuthKey_Lifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -1638,19 +1545,18 @@ func TestReconciler_AuthKey_Lifecycle(t *testing.T) {
 
 	t.Run("mints-key-on-first-reconcile", func(t *testing.T) {
 		pr := &tsapi.PeerRelay{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
-		fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-			WithScheme(tsapi.GlobalScheme).
+		fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 			WithStatusSubresource(&tsapi.PeerRelay{}).
 			WithObjects(pr).
 			Build()
 
-		tsc := &fakeTSClient{nextKey: []string{"tskey-abc"}}
+		tsc := reconcilertest.NewFakeClient(reconcilertest.WithAuthKeys("tskey-abc"))
 		r := peerrelay.NewReconciler(peerrelay.ReconcilerOptions{
 			Client:             fc,
 			TailscaleNamespace: tailscaleNamespace,
 			ProxyImage:         testProxyImage,
 			DefaultTags:        []string{"tag:k8s-peer-relay"},
-			Clients:            &fakeClientProvider{client: tsc},
+			Clients:            reconcilertest.NewFakeClientProvider(tsc),
 			Resolver:           testResolver,
 			Logger:             logger.Sugar(),
 		})
@@ -1676,19 +1582,18 @@ func TestReconciler_AuthKey_Lifecycle(t *testing.T) {
 
 	t.Run("reuses-existing-key-across-reconciles", func(t *testing.T) {
 		pr := &tsapi.PeerRelay{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
-		fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-			WithScheme(tsapi.GlobalScheme).
+		fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 			WithStatusSubresource(&tsapi.PeerRelay{}).
 			WithObjects(pr).
 			Build()
 
-		tsc := &fakeTSClient{nextKey: []string{"tskey-first", "tskey-second"}}
+		tsc := reconcilertest.NewFakeClient(reconcilertest.WithAuthKeys("tskey-first", "tskey-second"))
 		r := peerrelay.NewReconciler(peerrelay.ReconcilerOptions{
 			Client:             fc,
 			TailscaleNamespace: tailscaleNamespace,
 			ProxyImage:         testProxyImage,
 			DefaultTags:        []string{"tag:k8s-peer-relay"},
-			Clients:            &fakeClientProvider{client: tsc},
+			Clients:            reconcilertest.NewFakeClientProvider(tsc),
 			Resolver:           testResolver,
 			Logger:             logger.Sugar(),
 		})
@@ -1716,20 +1621,19 @@ func TestReconciler_AuthKey_Lifecycle(t *testing.T) {
 			Spec:       tsapi.PeerRelaySpec{Tags: tsapi.Tags{"tag:custom"}},
 		}
 
-		fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-			WithScheme(tsapi.GlobalScheme).
+		fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 			WithStatusSubresource(&tsapi.PeerRelay{}).
 			WithObjects(pr).
 			Build()
 
-		tsc := &fakeTSClient{}
+		tsc := reconcilertest.NewFakeClient()
 
 		r := peerrelay.NewReconciler(peerrelay.ReconcilerOptions{
 			Client:             fc,
 			TailscaleNamespace: tailscaleNamespace,
 			ProxyImage:         testProxyImage,
 			DefaultTags:        []string{"tag:k8s-peer-relay"},
-			Clients:            &fakeClientProvider{client: tsc},
+			Clients:            reconcilertest.NewFakeClientProvider(tsc),
 			Resolver:           testResolver,
 			Logger:             logger.Sugar(),
 		})
@@ -1784,27 +1688,40 @@ func TestReconciler_DeletesTailnetDevices(t *testing.T) {
 				Finalizers:        []string{"tailscale.com/finalizer"},
 				DeletionTimestamp: new(metav1.Now()),
 			},
-			Spec: tsapi.PeerRelaySpec{Replicas: new(int32(2))},
+			Spec: tsapi.PeerRelaySpec{Replicas: new(int32(3))},
 		}
 
-		fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-			WithScheme(tsapi.GlobalScheme).
+		// Replica 2 registered with control but never reported its device ID.
+		mk := key.NewMachine()
+		mkText, err := mk.MarshalText()
+		if err != nil {
+			t.Fatal(err)
+		}
+		unreported := stateSecret("test", "peerrelay-test-2", 2, "")
+		unreported.Data = map[string][]byte{string(ipn.MachineKeyStateKey): mkText}
+
+		fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 			WithStatusSubresource(&tsapi.PeerRelay{}, &appsv1.StatefulSet{}).
 			WithObjects(
 				pr,
 				stateSecret("test", "peerrelay-test-0", 0, "device-aaa"),
 				stateSecret("test", "peerrelay-test-1", 1, ""), // pod never registered , no device_id
+				unreported,
 				stateSecret("other", "peerrelay-other-0", 0, "device-should-not-touch"),
 			).
 			Build()
 
-		tsc := &fakeTSClient{}
+		tsc := reconcilertest.NewFakeClient()
+		tsc.SetDevices(
+			tailscaleclient.Device{NodeID: "device-bbb", MachineKey: mk.Public().String()},
+			tailscaleclient.Device{NodeID: "device-other", MachineKey: key.NewMachine().Public().String()},
+		)
 		r := peerrelay.NewReconciler(peerrelay.ReconcilerOptions{
 			Client:             fc,
 			TailscaleNamespace: tailscaleNamespace,
 			ProxyImage:         testProxyImage,
 			DefaultTags:        []string{"tag:test-peer-relay"},
-			Clients:            &fakeClientProvider{client: tsc},
+			Clients:            reconcilertest.NewFakeClientProvider(tsc),
 			Resolver:           testResolver,
 			Logger:             logger.Sugar(),
 		})
@@ -1813,12 +1730,14 @@ func TestReconciler_DeletesTailnetDevices(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if got, want := tsc.DeviceDeletes(), []string{"device-aaa"}; !slices.Equal(got, want) {
+		got := tsc.DeviceDeletes()
+		slices.Sort(got)
+		if want := []string{"device-aaa", "device-bbb"}; !slices.Equal(got, want) {
 			t.Errorf("expected Devices().Delete calls %v, got %v", want, got)
 		}
 
 		// Our state Secrets should be gone; the unrelated PeerRelay's state Secret should still be present.
-		for _, name := range []string{"peerrelay-test-0", "peerrelay-test-1"} {
+		for _, name := range []string{"peerrelay-test-0", "peerrelay-test-1", "peerrelay-test-2"} {
 			var s corev1.Secret
 			if err = fc.Get(t.Context(), types.NamespacedName{Namespace: tailscaleNamespace, Name: name}, &s); !apierrors.IsNotFound(err) {
 				t.Errorf("expected state Secret %q gone, got err=%v", name, err)
@@ -1836,8 +1755,7 @@ func TestReconciler_DeletesTailnetDevices(t *testing.T) {
 			Spec:       tsapi.PeerRelaySpec{Replicas: new(int32(1))},
 		}
 
-		fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-			WithScheme(tsapi.GlobalScheme).
+		fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 			WithStatusSubresource(&tsapi.PeerRelay{}, &appsv1.StatefulSet{}).
 			WithObjects(
 				pr,
@@ -1847,13 +1765,13 @@ func TestReconciler_DeletesTailnetDevices(t *testing.T) {
 			).
 			Build()
 
-		tsc := &fakeTSClient{}
+		tsc := reconcilertest.NewFakeClient()
 		r := peerrelay.NewReconciler(peerrelay.ReconcilerOptions{
 			Client:             fc,
 			TailscaleNamespace: tailscaleNamespace,
 			ProxyImage:         testProxyImage,
 			DefaultTags:        []string{"tag:test-peer-relay"},
-			Clients:            &fakeClientProvider{client: tsc},
+			Clients:            reconcilertest.NewFakeClientProvider(tsc),
 			Resolver:           testResolver,
 			Logger:             logger.Sugar(),
 		})
@@ -1896,8 +1814,7 @@ func TestReconciler_TailnetUnavailable(t *testing.T) {
 		Spec:       tsapi.PeerRelaySpec{Tailnet: "missing"},
 	}
 
-	fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-		WithScheme(tsapi.GlobalScheme).
+	fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 		WithStatusSubresource(&tsapi.PeerRelay{}).
 		WithObjects(pr).
 		Build()
@@ -1907,7 +1824,7 @@ func TestReconciler_TailnetUnavailable(t *testing.T) {
 		TailscaleNamespace: tailscaleNamespace,
 		ProxyImage:         testProxyImage,
 		DefaultTags:        []string{"tag:test-peer-relay"},
-		Clients:            &fakeClientProvider{err: errors.New("tailnet missing: not ready")},
+		Clients:            reconcilertest.NewFailingClientProvider(errors.New("tailnet missing: not ready")),
 		Resolver:           testResolver,
 		Logger:             logger.Sugar(),
 	})
@@ -1921,13 +1838,10 @@ func TestReconciler_TailnetUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cond := readyCondition(&got)
-	if cond.Status != metav1.ConditionFalse {
-		t.Errorf("expected PeerRelayReady=False, got %q", cond.Status)
-	}
-	if cond.Reason != peerrelay.ReasonTailnetUnavailable {
-		t.Errorf("expected reason=%s, got %q", peerrelay.ReasonTailnetUnavailable, cond.Reason)
-	}
+	reconcilertest.ExpectConditionStatus(t, got.Status.Conditions, tsapi.PeerRelayReady,
+		metav1.ConditionFalse, peerrelay.ReasonTailnetUnavailable)
+
+	cond := reconcilertest.Condition(t, got.Status.Conditions, tsapi.PeerRelayReady)
 	if !strings.Contains(cond.Message, "not ready") {
 		t.Errorf("expected condition message to include resolver error, got %q", cond.Message)
 	}
@@ -1975,10 +1889,10 @@ func TestReconciler_AppliesProxyClass(t *testing.T) {
 				},
 			},
 		},
+		Status: readyProxyClassStatus(),
 	}
 
-	fc := fake.NewClientBuilder().WithInterceptorFuncs(applyPatchInterceptor()).
-		WithScheme(tsapi.GlobalScheme).
+	fc := reconcilertest.NewClientBuilder().WithInterceptorFuncs(reconcilertest.ApplyPatchInterceptor()).
 		WithStatusSubresource(&tsapi.PeerRelay{}, &appsv1.StatefulSet{}).
 		WithObjects(pr, pc).
 		Build()
@@ -1988,7 +1902,7 @@ func TestReconciler_AppliesProxyClass(t *testing.T) {
 		TailscaleNamespace: tailscaleNamespace,
 		ProxyImage:         testProxyImage,
 		DefaultTags:        []string{"tag:test-peer-relay"},
-		Clients:            &fakeClientProvider{client: &fakeTSClient{}},
+		Clients:            reconcilertest.NewFakeClientProvider(reconcilertest.NewFakeClient()),
 		Resolver:           testResolver,
 		Logger:             logger.Sugar(),
 	})
@@ -2046,5 +1960,15 @@ func TestReconciler_AppliesProxyClass(t *testing.T) {
 	// The ProxyClass does not set a security context, so the default NET_ADMIN capability must survive.
 	if !hasCapability(c, "NET_ADMIN") {
 		t.Errorf("expected container to keep the NET_ADMIN capability, got security context %+v", c.SecurityContext)
+	}
+}
+
+// readyProxyClassStatus returns a ready status; the fake client leaves Generation at 0, so ObservedGeneration is too.
+func readyProxyClassStatus() tsapi.ProxyClassStatus {
+	return tsapi.ProxyClassStatus{
+		Conditions: []metav1.Condition{{
+			Type:   string(tsapi.ProxyClassReady),
+			Status: metav1.ConditionTrue,
+		}},
 	}
 }

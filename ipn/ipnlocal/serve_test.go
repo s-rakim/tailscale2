@@ -23,6 +23,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,10 +43,12 @@ import (
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
+	"tailscale.com/tstest/tlstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/eventbus/eventbustest"
+	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/util/syspolicy/policyclient"
@@ -819,8 +823,9 @@ func TestServeHTTPProxyHeaders(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &http.Request{
-				URL: &url.URL{Path: "/"},
-				TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
+				URL:    &url.URL{Path: "/"},
+				TLS:    &tls.ConnectionState{ServerName: "example.ts.net"},
+				Header: spoofedTailscaleHeaders(),
 			}
 			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
 				DestPort: 443,
@@ -837,6 +842,7 @@ func TestServeHTTPProxyHeaders(t *testing.T) {
 					t.Errorf("invalid %q header; want=%q, got=%q", c.header, c.want, got)
 				}
 			}
+			checkNoSpoofedTailscaleHeaders(t, h)
 		})
 	}
 }
@@ -962,8 +968,9 @@ func TestServeHTTPProxyGrantHeader(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &http.Request{
-				URL: &url.URL{Path: "/"},
-				TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
+				URL:    &url.URL{Path: "/"},
+				TLS:    &tls.ConnectionState{ServerName: "example.ts.net"},
+				Header: spoofedTailscaleHeaders(),
 			}
 			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
 				DestPort: 443,
@@ -987,7 +994,41 @@ func TestServeHTTPProxyGrantHeader(t *testing.T) {
 					t.Errorf("invalid %q header; want=%q, got=%q", c.header, c.want, got)
 				}
 			}
+			checkNoSpoofedTailscaleHeaders(t, h)
 		})
+	}
+}
+
+// spoofedTailscaleHeaders returns client-supplied request headers that try to
+// impersonate the headers set by `tailscale serve`. This includes variants
+// using '_' in place of '-' that CGI-style backends treat as equivalent.
+func spoofedTailscaleHeaders() http.Header {
+	h := http.Header{}
+	for _, name := range []string{
+		"Tailscale-User-Login",
+		"Tailscale-User-Name",
+		"Tailscale-User-Profile-Pic",
+		"Tailscale-Funnel-Request",
+		"Tailscale-Headers-Info",
+		"Tailscale-App-Capabilities",
+	} {
+		h[name] = []string{"spoofed"}
+		h[strings.ReplaceAll(name, "-", "_")] = []string{"spoofed"}
+		h[http.CanonicalHeaderKey(strings.ReplaceAll(strings.ToLower(name), "-", "_"))] = []string{"spoofed"}
+	}
+	return h
+}
+
+// checkNoSpoofedTailscaleHeaders reports an error if any value from
+// spoofedTailscaleHeaders made it to the backend.
+func checkNoSpoofedTailscaleHeaders(t *testing.T, h http.Header) {
+	t.Helper()
+	for k, vv := range h {
+		for _, v := range vv {
+			if strings.Contains(v, "spoofed") {
+				t.Errorf("spoofed header %q reached backend: %q", k, v)
+			}
+		}
 	}
 }
 
@@ -1323,12 +1364,14 @@ func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 	sys.Set(e)
 	sys.Set(new(mem.Store))
 
+	// Create temp dir before setting up the backend and the shutdown to ensure
+	// cleanup can happen nicely with the full file system.
+	dir := t.TempDir()
 	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(b.Shutdown)
-	dir := t.TempDir()
 	b.SetVarRoot(dir)
 
 	pm := must.Get(newProfileManager(new(mem.Store), logf, health.NewTracker(bus)))
@@ -1384,9 +1427,11 @@ func TestServeFileOrDirectory(t *testing.T) {
 	writeFile("foo", "this is foo")
 	writeFile("bar", "this is bar")
 	os.MkdirAll(filepath.Join(td, "subdir"), 0o700)
+	os.MkdirAll(filepath.Join(td, "subdir", "nested"), 0o700)
 	writeFile("subdir/file-a", "this is A")
 	writeFile("subdir/file-b", "this is B")
 	writeFile("subdir/file-c", "this is C")
+	writeFile("subdir/nested/index.html", "this is nested index")
 
 	contains := func(subs ...string) func([]byte, *http.Response) error {
 		return func(resBody []byte, res *http.Response) error {
@@ -1438,7 +1483,12 @@ func TestServeFileOrDirectory(t *testing.T) {
 		{"/bar/inside-file", "/", isStatus(404)},
 		{"/subdir", "/", isRedirect("/subdir/")},
 		{"/subdir/", "/", contains("file-a", "file-b", "file-c")},
+		{"/subdir/nested", "/", isRedirect("/subdir/nested/")},
+		{"//subdir/nested", "/", isRedirect("/subdir/nested/")},
+		{"/subdir/nested/index.html", "/", isRedirect("/subdir/nested/")},
+		{"/subdir/nested?x=1", "/", isRedirect("/subdir/nested/?x=1")},
 		{"/subdir/file-a", "/", contains("this is A")},
+		{"/subdir/file-a/", "/", isRedirect("/subdir/file-a")},
 		{"/subdir/file-z", "/", isStatus(404)},
 
 		{"/doc", "/doc/", isRedirect("/doc/")},
@@ -1449,7 +1499,11 @@ func TestServeFileOrDirectory(t *testing.T) {
 		{"/doc/bar/inside-file", "/doc/", isStatus(404)},
 		{"/doc/subdir", "/doc/", isRedirect("/doc/subdir/")},
 		{"/doc/subdir/", "/doc/", contains("file-a", "file-b", "file-c")},
+		{"/doc/subdir/nested", "/doc/", isRedirect("/doc/subdir/nested/")},
+		{"/doc/subdir/nested/index.html", "/doc/", isRedirect("/doc/subdir/nested/")},
+		{"/doc/subdir/nested?x=1", "/doc/", isRedirect("/doc/subdir/nested/?x=1")},
 		{"/doc/subdir/file-a", "/doc/", contains("this is A")},
+		{"/doc/subdir/file-a/", "/doc/", isRedirect("/doc/subdir/file-a")},
 		{"/doc/subdir/file-z", "/doc/", isStatus(404)},
 	}
 	for _, tt := range tests {
@@ -1463,6 +1517,167 @@ func TestServeFileOrDirectory(t *testing.T) {
 		if err := tt.want(rec.Body.Bytes(), rec.Result()); err != nil {
 			t.Errorf("error for req %q (mount %v): %v", tt.req, tt.mount, err)
 		}
+	}
+}
+
+// newSymlinkServeTree creates a directory to serve, webroot, next to a
+// directory, outside, whose file secret.txt must never be served, and
+// returns the path to webroot. Besides a file and a subdirectory, webroot
+// holds symlinks that lead out of it and symlinks that stay inside it.
+func newSymlinkServeTree(t *testing.T) (root string) {
+	t.Helper()
+	base := t.TempDir()
+	root = filepath.Join(base, "webroot")
+	outside := filepath.Join(base, "outside")
+	for _, d := range []string{root, outside, filepath.Join(root, "sub")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite := func(p, s string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(filepath.Join(root, "inside.txt"), "INSIDE-OK")
+	mustWrite(filepath.Join(root, "sub", "nested.txt"), "NESTED-OK")
+	mustWrite(filepath.Join(outside, "secret.txt"), "TOP-SECRET")
+
+	mustSymlink := func(target, linkName string) {
+		t.Helper()
+		if err := os.Symlink(target, filepath.Join(root, linkName)); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("can't create symlinks: %v", err)
+			}
+			t.Fatal(err)
+		}
+	}
+	// os.Root refuses symlinks whose target leaves the root, and absolute
+	// symlinks even when they point inside the root, but follows relative
+	// symlinks that stay inside it.
+	mustSymlink("../outside", "escape-rel-dir")
+	mustSymlink("../outside/secret.txt", "escape-rel-file")
+	mustSymlink(filepath.Join(outside, "secret.txt"), "escape-abs")
+	mustSymlink(filepath.Join(root, "sub", "nested.txt"), "inroot-abs")
+	mustSymlink("sub/nested.txt", "inroot-rel")
+	mustSymlink("sub", "inroot-rel-dir")
+	return root
+}
+
+// TestServeFileOrDirectoryConfinesSymlinks verifies that a served directory
+// doesn't follow symlinks that lead out of it, while files, subdirectories
+// and relative symlinks that stay inside it are still served.
+func TestServeFileOrDirectoryConfinesSymlinks(t *testing.T) {
+	root := newSymlinkServeTree(t)
+	b := &LocalBackend{
+		logf:   t.Logf,
+		health: health.NewTracker(eventbustest.NewBus(t)),
+	}
+
+	mounts := []struct {
+		name  string
+		mount string
+	}{
+		{"root-mount", "/"},
+		{"sub-mount", "/files/"},
+	}
+	tests := []struct {
+		name       string
+		path       string // request path, relative to the mount point
+		wantStatus int
+		wantBody   string
+	}{
+		{"file", "inside.txt", 200, "INSIDE-OK"},
+		{"nested-file", "sub/nested.txt", 200, "NESTED-OK"},
+		{"relative-in-root-symlink", "inroot-rel", 200, "NESTED-OK"},
+		{"relative-in-root-dir-symlink", "inroot-rel-dir/nested.txt", 200, "NESTED-OK"},
+		{"escaping-dir-symlink", "escape-rel-dir/secret.txt", 404, ""},
+		{"escaping-file-symlink", "escape-rel-file", 404, ""},
+		{"absolute-symlink", "escape-abs", 404, ""},
+		{"absolute-in-root-symlink", "inroot-abs", 404, ""},
+	}
+	for _, m := range mounts {
+		t.Run(m.name, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					rec := httptest.NewRecorder()
+					req := httptest.NewRequest("GET", m.mount+tt.path, nil)
+					b.serveFileOrDirectory(rec, req, root, m.mount)
+					checkServeResponse(t, rec, req, tt.wantStatus, tt.wantBody)
+				})
+			}
+		})
+	}
+}
+
+// TestServeFileOrDirectoryConfinesTarget verifies that the configured path
+// itself, a single file or a directory, is resolved inside the directory
+// that contains it: a symlink there that leads out of that directory, or an
+// absolute one, is refused, while a relative symlink that stays inside it
+// is still served.
+func TestServeFileOrDirectoryConfinesTarget(t *testing.T) {
+	root := newSymlinkServeTree(t)
+	b := &LocalBackend{
+		logf:   t.Logf,
+		health: health.NewTracker(eventbustest.NewBus(t)),
+	}
+
+	tests := []struct {
+		name       string
+		target     string // configured path, relative to root
+		mount      string
+		req        string
+		wantStatus int
+		wantBody   string
+	}{
+		{"file", "inside.txt", "/f", "/f", 200, "INSIDE-OK"},
+		{"relative-in-parent-file-symlink", "inroot-rel", "/f", "/f", 200, "NESTED-OK"},
+		{"escaping-file-symlink", "escape-rel-file", "/f", "/f", 500, ""},
+		{"absolute-file-symlink", "escape-abs", "/f", "/f", 500, ""},
+		{"absolute-in-parent-file-symlink", "inroot-abs", "/f", "/f", 500, ""},
+		{"dir", "sub", "/files/", "/files/nested.txt", 200, "NESTED-OK"},
+		{"relative-in-parent-dir-symlink", "inroot-rel-dir", "/files/", "/files/nested.txt", 200, "NESTED-OK"},
+		{"escaping-dir-symlink", "escape-rel-dir", "/files/", "/files/secret.txt", 500, ""},
+		// A single file swapped for a symlink to a directory must not turn
+		// its mount point into a listing of that directory.
+		{"file-mount-escaping-dir-symlink", "escape-rel-dir", "/f", "/f/secret.txt", 500, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", tt.req, nil)
+			b.serveFileOrDirectory(rec, req, filepath.Join(root, tt.target), tt.mount)
+			checkServeResponse(t, rec, req, tt.wantStatus, tt.wantBody)
+		})
+	}
+
+	// A filesystem root has no parent directory to resolve it in, so it is
+	// opened as is.
+	t.Run("filesystem-root", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		b.serveFileOrDirectory(rec, req, string(filepath.Separator), "/")
+		if rec.Code != 200 {
+			t.Errorf("GET %s: status = %d; want 200 (body: %q)", req.URL.Path, rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// checkServeResponse reports an error if rec, the response to req, doesn't
+// have the status wantStatus and a body containing wantBody, or if it served
+// the secret file from outside the tree made by newSymlinkServeTree.
+func checkServeResponse(t *testing.T, rec *httptest.ResponseRecorder, req *http.Request, wantStatus int, wantBody string) {
+	t.Helper()
+	body := rec.Body.String()
+	if rec.Code != wantStatus {
+		t.Errorf("GET %s: status = %d; want %d (body: %q)", req.URL.Path, rec.Code, wantStatus, body)
+	}
+	if !strings.Contains(body, wantBody) {
+		t.Errorf("GET %s: body = %q; want it to contain %q", req.URL.Path, body, wantBody)
+	}
+	if strings.Contains(body, "TOP-SECRET") {
+		t.Errorf("GET %s: served a file from outside the root", req.URL.Path)
 	}
 }
 
@@ -1726,6 +1941,87 @@ func TestServeProxyHTTP2PreservesContentType(t *testing.T) {
 // b.serveWebHandler entry point (the actual production code path) via a real
 // HTTP/2 TLS frontend, with serveHTTPContext.Funnel set to mimic a funnel
 // request. Repro probe for tailscale/tailscale#19866.
+// stallAfterEOF delays the Read that follows the one that returned io.EOF.
+// For a request body with a Content-Length, that is the Transport's extra
+// read that checks for EOF after it copied the declared bytes upstream
+// (net/http transfer.go, transferWriter.writeBody). The delay stands in
+// for a descheduled goroutine and gives the backend time to answer first.
+type stallAfterEOF struct {
+	io.ReadCloser
+	stall  time.Duration
+	sawEOF bool
+}
+
+func (s *stallAfterEOF) Read(p []byte) (int, error) {
+	if s.sawEOF {
+		time.Sleep(s.stall)
+	}
+	n, err := s.ReadCloser.Read(p)
+	if err == io.EOF {
+		s.sawEOF = true
+	}
+	return n, err
+}
+
+// TestServeProxyStreamedResponseWithRequestBody reproduces
+// tailscale/tailscale#21894: an HTTP/1.1 client POSTs to a backend that
+// flushes the start of its response as soon as it has read the request.
+// When the response reaches the proxy's HTTP/1 server before the proxy's
+// Transport has done its final EOF read of the request body, the server
+// closes that body (golang/go#15527 behavior), the Transport's read fails,
+// the Transport closes the upstream connection, and the client gets a
+// truncated response.
+func TestServeProxyStreamedResponseWithRequestBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(50 * time.Millisecond)
+		io.WriteString(w, "data: final\n\n")
+	}))
+	defer backend.Close()
+
+	rp := &reverseProxy{
+		logf:    t.Logf,
+		url:     must.Get(url.Parse(backend.URL)),
+		backend: backend.URL,
+		lb:      newTestBackend(t),
+	}
+
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = &stallAfterEOF{ReadCloser: r.Body, stall: 20 * time.Millisecond}
+		rp.ServeHTTP(w, r)
+	}))
+	defer front.Close()
+
+	// Plain HTTP: the client speaks HTTP/1.1.
+	client := front.Client()
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	const attempts = 5
+	var truncated int
+	for i := range attempts {
+		req := must.Get(http.NewRequest(httpm.POST, front.URL, bytes.NewReader(body)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || !strings.Contains(string(got), "data: final") {
+			t.Logf("attempt %d: truncated response %q, read error %v", i, got, err)
+			truncated++
+		}
+	}
+	if truncated > 0 {
+		t.Errorf("%d of %d responses were truncated", truncated, attempts)
+	}
+}
+
 func TestServeWebHandlerHTTP2PreservesContentType(t *testing.T) {
 	var gotHeader http.Header
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2334,5 +2630,116 @@ func TestReverseProxyRechecksTailscaledSocketPerDial(t *testing.T) {
 	}
 	if _, err := rp.lb.dialServeUnixSocket(t.Context(), rp.socketPath); !errors.Is(err, ErrProxyToTailscaledSocket) {
 		t.Fatalf("dial after the symlink swap = %v; want ErrProxyToTailscaledSocket", err)
+	}
+}
+
+// TestServeWebHandlerHostNormalization checks that a request is matched
+// to its serve config regardless of how the client spells the name. DNS
+// names are case-insensitive and may carry a trailing dot, while serve
+// config keys are always lowercase with no trailing dot. For plain HTTP
+// the name comes from the Host header. For HTTPS it comes from SNI, which
+// cannot carry a trailing dot but is not lowercased by TLS. (#21538, #21986)
+func TestServeWebHandlerHostNormalization(t *testing.T) {
+	b := newTestBackend(t)
+	b.pm.currentProfile = (&ipn.LoginProfile{
+		ID:             "id0",
+		NetworkProfile: ipn.NetworkProfile{MagicDNSName: "example.ts.net"},
+	}).View()
+	conf := &ipn.ServeConfig{
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{
+			"svelte.example.ts.net:12075": {
+				Handlers: map[string]*ipn.HTTPHandler{"/": {Text: "hello"}},
+			},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		host     string // Host header for plain HTTP; SNI for HTTPS
+		tls      bool
+		wantCode int
+	}{
+		{host: "svelte.example.ts.net:12075", wantCode: http.StatusOK},
+		{host: "svelte:12075", wantCode: http.StatusOK},
+		{host: "svelte.example.ts.net.:12075", wantCode: http.StatusOK},
+		{host: "svelte.example.ts.net.", wantCode: http.StatusOK},
+		{host: "svelte.:12075", wantCode: http.StatusOK},
+		{host: "Svelte.Example.TS.net:12075", wantCode: http.StatusOK},
+		{host: "SVELTE:12075", wantCode: http.StatusOK},
+		{host: "other.example.ts.net:12075", wantCode: http.StatusNotFound},
+		{host: "svelte.example.ts.net..:12075", wantCode: http.StatusNotFound},
+		{host: "svelte.example.ts.net", tls: true, wantCode: http.StatusOK},
+		{host: "Svelte.Example.TS.net", tls: true, wantCode: http.StatusOK},
+		{host: "other.example.ts.net", tls: true, wantCode: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		name := tt.host
+		if tt.tls {
+			name = "tls/" + name
+		}
+		t.Run(name, func(t *testing.T) {
+			req := &http.Request{Host: tt.host, URL: &url.URL{Path: "/"}, RequestURI: "/"}
+			if tt.tls {
+				req.TLS = &tls.ConnectionState{ServerName: tt.host}
+			}
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+				DestPort: 12075,
+				SrcAddr:  netip.MustParseAddrPort("100.64.0.2:1234"),
+			}))
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, req)
+			if w.Code != tt.wantCode {
+				t.Errorf("%s: got %d, want %d", name, w.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+// TestGetTLSServeCertForPortLowercasesSNI checks that the serve TLS cert
+// callback lowercases the SNI before both the serve config lookup and the
+// cert lookup. Cert domains are lowercase and matched exactly, so passing
+// the SNI through as sent made a mixed-case ClientHello fail the handshake.
+func TestGetTLSServeCertForPortLowercasesSNI(t *testing.T) {
+	b := newTestBackend(t)
+	conf := &ipn.ServeConfig{
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{
+			"svelte.example.ts.net:443": {
+				Handlers: map[string]*ipn.HTTPHandler{"/": {Text: "hello"}},
+			},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotDomain string
+	restore := HookGetCertPEM.SetForTest(func(_ context.Context, _ *LocalBackend, domain string, _ time.Duration) (*TLSCertKeyPair, error) {
+		gotDomain = domain
+		if domain != "svelte.example.ts.net" {
+			return nil, fmt.Errorf("invalid domain %q", domain)
+		}
+		d := tlstest.Domain(domain)
+		return &TLSCertKeyPair{CertPEM: d.CertPEM(), KeyPEM: d.KeyPEM()}, nil
+	})
+	defer restore()
+
+	getCert := b.getTLSServeCertForPort(443, "")
+	for _, sni := range []string{"svelte.example.ts.net", "Svelte.Example.TS.net"} {
+		gotDomain = ""
+		cert, err := getCert(&tls.ClientHelloInfo{ServerName: sni})
+		if err != nil {
+			t.Errorf("SNI %q: %v", sni, err)
+			continue
+		}
+		if gotDomain != "svelte.example.ts.net" {
+			t.Errorf("SNI %q: cert looked up for %q", sni, gotDomain)
+		}
+		if cert == nil || cert.Leaf == nil || !slices.Contains(cert.Leaf.DNSNames, "svelte.example.ts.net") {
+			t.Errorf("SNI %q: unexpected cert %+v", sni, cert)
+		}
+	}
+	if _, err := getCert(&tls.ClientHelloInfo{ServerName: "Other.Example.TS.net"}); err == nil {
+		t.Error("unconfigured name: got cert, want error")
 	}
 }

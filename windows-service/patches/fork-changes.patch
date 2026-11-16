@@ -1,0 +1,668 @@
+diff --git a/client/local/wakeonlan.go b/client/local/wakeonlan.go
+new file mode 100644
+index 000000000..d92a98917
+--- /dev/null
++++ b/client/local/wakeonlan.go
+@@ -0,0 +1,35 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !ts_omit_wakeonlan
++
++package local
++
++import (
++	"context"
++	"net/http"
++	"net/url"
++
++	"tailscale.com/client/tailscale/apitype"
++)
++
++// WakeOnLAN sends Wake-on-LAN magic packets to wake target.
++//
++// The target is either a MAC address or the name or Tailscale IP of a device
++// in the tailnet that advertises its Wake-on-LAN MAC addresses (see
++// TS_WAKE_MAC). If via is empty, the packets are broadcast from this machine's
++// LANs. Otherwise via is the name or Tailscale IP of an awake peer on the
++// target's LAN, which broadcasts the packets on its LANs instead.
++//
++// API maturity: this method is not considered a stable API and is subject to change between releases.
++func (lc *Client) WakeOnLAN(ctx context.Context, target, via string) (*apitype.WakeOnLANResponse, error) {
++	v := url.Values{"target": {target}}
++	if via != "" {
++		v.Set("via", via)
++	}
++	body, err := lc.send(ctx, "POST", "/localapi/v0/wake-on-lan?"+v.Encode(), http.StatusOK, nil)
++	if err != nil {
++		return nil, err
++	}
++	return decodeJSON[*apitype.WakeOnLANResponse](body)
++}
+diff --git a/client/tailscale/apitype/apitype.go b/client/tailscale/apitype/apitype.go
+index 4524bf9ba..746ecb504 100644
+--- a/client/tailscale/apitype/apitype.go
++++ b/client/tailscale/apitype/apitype.go
+@@ -127,3 +127,20 @@ type ServiceClientPrefRequest struct {
+ 	// DatabaseName is the database name that the user entered in the service launch. Optional.
+ 	DatabaseName string `json:",omitzero"`
+ }
++
++// WakeOnLANResponse is the response to a LocalAPI "wake-on-lan" request.
++type WakeOnLANResponse struct {
++	// Via is the name of the node that sent the magic packets.
++	// It's the local node's name if the packets were sent locally.
++	Via string
++
++	// MACs are the MAC addresses that magic packets were sent to.
++	MACs []string
++
++	// SentTo are the network interface names, on the Via node,
++	// that magic packets were broadcast on.
++	SentTo []string `json:",omitempty"`
++
++	// Errors are any errors encountered sending the packets.
++	Errors []string `json:",omitempty"`
++}
+diff --git a/cmd/tailscale/cli/cli.go b/cmd/tailscale/cli/cli.go
+index 2f9243013..0033836c0 100644
+--- a/cmd/tailscale/cli/cli.go
++++ b/cmd/tailscale/cli/cli.go
+@@ -240,6 +240,7 @@ type restore struct {
+ 	fileCmd,
+ 	sysPolicyCmd,
+ 	maybeRoutecheckCmd,
++	maybeWakeOnLANCmd,
+ 	maybeWebCmd,
+ 	maybeDriveCmd,
+ 	maybeTailnetLockCmd,
+@@ -289,6 +290,7 @@ func newRootCmd(tb ...testenv.TB) *ffcli.Command {
+ 			metricsCmd,
+ 			pingCmd,
+ 			ncCmd,
++			nilOrCall(maybeWakeOnLANCmd),
+ 			sshCmd,
+ 			nilOrCall(maybeFunnelCmd),
+ 			nilOrCall(maybeServeCmd),
+diff --git a/cmd/tailscale/cli/wakeonlan.go b/cmd/tailscale/cli/wakeonlan.go
+new file mode 100644
+index 000000000..4d44e8e28
+--- /dev/null
++++ b/cmd/tailscale/cli/wakeonlan.go
+@@ -0,0 +1,85 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !ts_omit_wakeonlan
++
++package cli
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"flag"
++	"fmt"
++	"os"
++	"strings"
++
++	"github.com/peterbourgon/ff/v3/ffcli"
++)
++
++func init() {
++	maybeWakeOnLANCmd = wakeOnLANCmd
++}
++
++var wakeOnLANCmd = func() *ffcli.Command {
++	return &ffcli.Command{
++		Name:       "wol",
++		ShortUsage: "tailscale wol [--via=<device>] <device|MAC>",
++		ShortHelp:  "Wake a sleeping machine with Wake-on-LAN",
++		LongHelp: strings.TrimSpace(`
++"tailscale wol" sends a Wake-on-LAN magic packet to wake a sleeping machine.
++
++The target is either a MAC address or the name or Tailscale IP of a device in
++your tailnet. To wake a tailnet device by name, it must advertise its MAC
++addresses, which it does when its tailscaled runs with TS_WAKE_MAC=auto (or
++TS_WAKE_MAC=<mac>).
++
++Wake-on-LAN packets only travel within a LAN. By default they are broadcast
++from this machine. If the sleeping machine is elsewhere, use --via to name an
++awake device on its LAN; that device broadcasts the packets for you. The relay
++device must be owned by you, or grant you the Wake-on-LAN peer capability.
++
++Examples:
++
++  tailscale wol --via=nas desktop
++  tailscale wol --via=100.101.102.103 aa:bb:cc:dd:ee:ff
++  tailscale wol aa:bb:cc:dd:ee:ff
++`),
++		Exec: runWakeOnLAN,
++		FlagSet: func() *flag.FlagSet {
++			fs := newFlagSet("wol")
++			fs.StringVar(&wolArgs.via, "via", "", "name or Tailscale IP of an awake device on the target's LAN to send the packets from (default: this machine)")
++			fs.BoolVar(&wolArgs.json, "json", false, "output in JSON format")
++			return fs
++		}(),
++	}
++}
++
++var wolArgs struct {
++	via  string
++	json bool
++}
++
++func runWakeOnLAN(ctx context.Context, args []string) error {
++	if len(args) != 1 {
++		return errors.New("usage: tailscale wol [--via=<device>] <device|MAC>")
++	}
++	res, err := localClient.WakeOnLAN(ctx, args[0], wolArgs.via)
++	if err != nil {
++		return err
++	}
++	if wolArgs.json {
++		enc := json.NewEncoder(os.Stdout)
++		enc.SetIndent("", "  ")
++		return enc.Encode(res)
++	}
++	for _, e := range res.Errors {
++		printf("warning: %s\n", e)
++	}
++	if len(res.SentTo) == 0 {
++		return fmt.Errorf("no Wake-on-LAN packets were sent from %s", res.Via)
++	}
++	printf("Sent Wake-on-LAN packet for %s from %s on %s\n",
++		strings.Join(res.MACs, ", "), res.Via, strings.Join(res.SentTo, ", "))
++	return nil
++}
+diff --git a/feature/wakeonlan/localapi.go b/feature/wakeonlan/localapi.go
+new file mode 100644
+index 000000000..00647ca59
+--- /dev/null
++++ b/feature/wakeonlan/localapi.go
+@@ -0,0 +1,221 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package wakeonlan
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/netip"
++	"net/url"
++	"sort"
++	"strings"
++	"time"
++
++	"tailscale.com/client/tailscale/apitype"
++	"tailscale.com/ipn/ipnext"
++	"tailscale.com/ipn/localapi"
++	"tailscale.com/tailcfg"
++	"tailscale.com/util/httpm"
++)
++
++// serveLocalAPIWakeOnLAN handles POST /localapi/v0/wake-on-lan.
++//
++// The "target" query parameter is either a MAC address or the name or
++// Tailscale IP of a node whose advertised Wake-on-LAN MACs should be woken.
++// The optional "via" query parameter names a peer on the target's LAN that
++// should broadcast the magic packets. If "via" is empty, they're broadcast
++// from this node.
++func serveLocalAPIWakeOnLAN(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
++	if !h.PermitWrite {
++		http.Error(w, "wake-on-lan access denied", http.StatusForbidden)
++		return
++	}
++	if r.Method != httpm.POST {
++		http.Error(w, "use POST", http.StatusMethodNotAllowed)
++		return
++	}
++	b := h.LocalBackend()
++	nb := b.NodeBackend()
++
++	macs, err := resolveTargetMACs(nb, r.FormValue("target"))
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++
++	via := nb.Self()
++	if v := r.FormValue("via"); v != "" {
++		var ok bool
++		via, ok = findNode(nb, v)
++		if !ok {
++			http.Error(w, fmt.Sprintf("no device %q found in your tailnet", v), http.StatusBadRequest)
++			return
++		}
++	}
++
++	res := &apitype.WakeOnLANResponse{Via: nodeShortName(via)}
++	for _, mac := range macs {
++		res.MACs = append(res.MACs, mac.String())
++	}
++	if !via.Valid() || via.ID() == nb.Self().ID() {
++		st := b.NetMon().InterfaceState()
++		if st == nil {
++			http.Error(w, "failed to get interfaces state", http.StatusInternalServerError)
++			return
++		}
++		for _, mac := range macs {
++			sentTo, errs := broadcastMagicPacket(st, mac)
++			res.SentTo = append(res.SentTo, sentTo...)
++			res.Errors = append(res.Errors, errs...)
++		}
++	} else {
++		base := nb.PeerAPIBase(via)
++		if base == "" {
++			http.Error(w, fmt.Sprintf("device %q is offline or does not support Wake-on-LAN relaying", res.Via), http.StatusBadRequest)
++			return
++		}
++		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
++		defer cancel()
++		tr := b.Dialer().PeerAPITransport()
++		for _, mac := range macs {
++			sentTo, errs := wakeViaPeer(ctx, tr, base, mac)
++			res.SentTo = append(res.SentTo, sentTo...)
++			res.Errors = append(res.Errors, errs...)
++		}
++	}
++	sort.Strings(res.SentTo)
++	res.SentTo = uniq(res.SentTo)
++	writeJSON(w, res)
++}
++
++// resolveTargetMACs returns the MAC addresses to wake for target, which is
++// either a MAC address or the name or Tailscale IP of a node that advertises
++// its Wake-on-LAN MACs in its Hostinfo.
++func resolveTargetMACs(nb ipnext.NodeBackend, target string) ([]net.HardwareAddr, error) {
++	if target == "" {
++		return nil, errors.New("missing 'target' param")
++	}
++	if mac, err := net.ParseMAC(target); err == nil {
++		return []net.HardwareAddr{mac}, nil
++	}
++	n, ok := findNode(nb, target)
++	if !ok {
++		return nil, fmt.Errorf("%q is not a MAC address or a device in your tailnet", target)
++	}
++	var macs []net.HardwareAddr
++	if hi := n.Hostinfo(); hi.Valid() {
++		for _, s := range hi.WoLMACs().All() {
++			if mac, err := net.ParseMAC(s); err == nil {
++				macs = append(macs, mac)
++			}
++		}
++	}
++	if len(macs) == 0 {
++		return nil, fmt.Errorf("device %q has not advertised any Wake-on-LAN MAC addresses; run tailscaled on it with TS_WAKE_MAC=auto (or TS_WAKE_MAC=<mac>), or pass its MAC address directly", nodeShortName(n))
++	}
++	return macs, nil
++}
++
++// findNode returns the node (self or a peer) whose Tailscale IP, MagicDNS
++// name, or short hostname matches s.
++func findNode(nb ipnext.NodeBackend, s string) (_ tailcfg.NodeView, ok bool) {
++	// Only uses NodeBackend methods that exist in every recent release, so
++	// this file applies cleanly on top of stable tags as well as main.
++	var match func(tailcfg.NodeView) bool
++	if ip, err := netip.ParseAddr(s); err == nil {
++		match = func(n tailcfg.NodeView) bool {
++			if !n.Valid() {
++				return false
++			}
++			for _, a := range n.Addresses().All() {
++				if a.IsSingleIP() && a.Addr() == ip {
++					return true
++				}
++			}
++			return false
++		}
++	} else {
++		match = func(n tailcfg.NodeView) bool {
++			return n.Valid() && nodeNameMatches(n, s)
++		}
++	}
++	if self := nb.Self(); match(self) {
++		return self, true
++	}
++	peers := nb.AppendMatchingPeers(nil, match)
++	if len(peers) == 0 {
++		return tailcfg.NodeView{}, false
++	}
++	return peers[0], true
++}
++
++// nodeNameMatches reports whether s names n, either by its full MagicDNS
++// name (with or without the trailing dot), its first DNS label, or its
++// computed display name.
++func nodeNameMatches(n tailcfg.NodeView, s string) bool {
++	s = strings.TrimSuffix(s, ".")
++	full := strings.TrimSuffix(n.Name(), ".")
++	return strings.EqualFold(full, s) ||
++		strings.EqualFold(nodeShortName(n), s) ||
++		strings.EqualFold(n.ComputedName(), s)
++}
++
++// nodeShortName returns the first label of n's MagicDNS name.
++func nodeShortName(n tailcfg.NodeView) string {
++	if !n.Valid() {
++		return ""
++	}
++	name, _, _ := strings.Cut(n.Name(), ".")
++	if name == "" {
++		return n.ComputedName()
++	}
++	return name
++}
++
++// wakeViaPeer asks the peer whose PeerAPI is at base to broadcast a magic
++// packet for mac on its LANs.
++func wakeViaPeer(ctx context.Context, tr http.RoundTripper, base string, mac net.HardwareAddr) (sentTo, errs []string) {
++	body := url.Values{"mac": {mac.String()}}.Encode()
++	req, err := http.NewRequestWithContext(ctx, httpm.POST, base+"/v0/wol", strings.NewReader(body))
++	if err != nil {
++		return nil, []string{err.Error()}
++	}
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	res, err := tr.RoundTrip(req)
++	if err != nil {
++		return nil, []string{err.Error()}
++	}
++	defer res.Body.Close()
++	if res.StatusCode != http.StatusOK {
++		msg, _ := io.ReadAll(io.LimitReader(res.Body, 1<<10))
++		return nil, []string{fmt.Sprintf("peer returned %v: %s", res.Status, strings.TrimSpace(string(msg)))}
++	}
++	var pr struct {
++		SentTo []string
++		Errors []string
++	}
++	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&pr); err != nil {
++		return nil, []string{err.Error()}
++	}
++	return pr.SentTo, pr.Errors
++}
++
++// uniq removes adjacent duplicates from the sorted slice s.
++func uniq(s []string) []string {
++	if len(s) < 2 {
++		return s
++	}
++	out := s[:1]
++	for _, v := range s[1:] {
++		if v != out[len(out)-1] {
++			out = append(out, v)
++		}
++	}
++	return out
++}
+diff --git a/feature/wakeonlan/localapi_test.go b/feature/wakeonlan/localapi_test.go
+new file mode 100644
+index 000000000..7df43ccaa
+--- /dev/null
++++ b/feature/wakeonlan/localapi_test.go
+@@ -0,0 +1,133 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package wakeonlan
++
++import (
++	"net/netip"
++	"slices"
++	"testing"
++
++	"tailscale.com/ipn/ipnext"
++	"tailscale.com/tailcfg"
++)
++
++// fakeNodeBackend implements the parts of [ipnext.NodeBackend] used by
++// the LocalAPI handler.
++type fakeNodeBackend struct {
++	ipnext.NodeBackend
++	self  tailcfg.NodeView
++	peers []tailcfg.NodeView
++}
++
++func (f *fakeNodeBackend) Self() tailcfg.NodeView { return f.self }
++
++func (f *fakeNodeBackend) all() []tailcfg.NodeView {
++	return append([]tailcfg.NodeView{f.self}, f.peers...)
++}
++
++func (f *fakeNodeBackend) NodeByAddr(ip netip.Addr) (tailcfg.NodeID, bool) {
++	for _, n := range f.all() {
++		for _, a := range n.Addresses().All() {
++			if a.Addr() == ip {
++				return n.ID(), true
++			}
++		}
++	}
++	return 0, false
++}
++
++func (f *fakeNodeBackend) NodeByID(id tailcfg.NodeID) (tailcfg.NodeView, bool) {
++	for _, n := range f.all() {
++		if n.ID() == id {
++			return n, true
++		}
++	}
++	return tailcfg.NodeView{}, false
++}
++
++func (f *fakeNodeBackend) AppendMatchingPeers(base []tailcfg.NodeView, pred func(tailcfg.NodeView) bool) []tailcfg.NodeView {
++	for _, p := range f.peers {
++		if pred(p) {
++			base = append(base, p)
++		}
++	}
++	return base
++}
++
++func newTestNodeBackend() *fakeNodeBackend {
++	node := func(id tailcfg.NodeID, name, ip string, macs ...string) tailcfg.NodeView {
++		return (&tailcfg.Node{
++			ID:        id,
++			Name:      name,
++			Addresses: []netip.Prefix{netip.MustParsePrefix(ip + "/32")},
++			Hostinfo:  (&tailcfg.Hostinfo{WoLMACs: macs}).View(),
++		}).View()
++	}
++	return &fakeNodeBackend{
++		self: node(1, "laptop.example.ts.net.", "100.64.0.1"),
++		peers: []tailcfg.NodeView{
++			node(2, "desktop.example.ts.net.", "100.64.0.2", "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"),
++			node(3, "nas.example.ts.net.", "100.64.0.3"),
++		},
++	}
++}
++
++func TestResolveTargetMACs(t *testing.T) {
++	nb := newTestNodeBackend()
++	tests := []struct {
++		name    string
++		target  string
++		want    []string
++		wantErr bool
++	}{
++		{name: "mac", target: "AA-BB-CC-00-11-22", want: []string{"aa:bb:cc:00:11:22"}},
++		{name: "short_name", target: "desktop", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
++		{name: "magicdns_name", target: "DESKTOP.example.ts.net", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
++		{name: "tailscale_ip", target: "100.64.0.2", want: []string{"aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"}},
++		{name: "no_macs", target: "nas", wantErr: true},            // no advertised MACs
++		{name: "unknown_device", target: "printer", wantErr: true}, // unknown device
++		{name: "unknown_ip", target: "100.64.9.9", wantErr: true},
++		{name: "empty", target: "", wantErr: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			macs, err := resolveTargetMACs(nb, tt.target)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
++			}
++			var got []string
++			for _, m := range macs {
++				got = append(got, m.String())
++			}
++			if !slices.Equal(got, tt.want) {
++				t.Errorf("got %q, want %q", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestFindNode(t *testing.T) {
++	nb := newTestNodeBackend()
++	for s, wantID := range map[string]tailcfg.NodeID{
++		"laptop":              1,
++		"nas":                 3,
++		"nas.example.ts.net.": 3,
++		"100.64.0.2":          2,
++	} {
++		n, ok := findNode(nb, s)
++		if !ok || n.ID() != wantID {
++			t.Errorf("findNode(%q) = %v, %v; want node %v", s, n.ID(), ok, wantID)
++		}
++	}
++	if _, ok := findNode(nb, "missing"); ok {
++		t.Error("findNode(missing) found a node")
++	}
++}
++
++func TestUniq(t *testing.T) {
++	got := uniq([]string{"eth0", "eth0", "eth1", "wlan0", "wlan0"})
++	if want := []string{"eth0", "eth1", "wlan0"}; !slices.Equal(got, want) {
++		t.Errorf("got %q, want %q", got, want)
++	}
++}
+diff --git a/feature/wakeonlan/wakeonlan.go b/feature/wakeonlan/wakeonlan.go
+index a8e567ef7..3f05dc4d3 100644
+--- a/feature/wakeonlan/wakeonlan.go
++++ b/feature/wakeonlan/wakeonlan.go
+@@ -19,6 +19,8 @@
+ 	"tailscale.com/feature"
+ 	"tailscale.com/hostinfo"
+ 	"tailscale.com/ipn/ipnlocal"
++	"tailscale.com/ipn/localapi"
++	"tailscale.com/net/netmon"
+ 	"tailscale.com/tailcfg"
+ 	"tailscale.com/tailcfg/peercap"
+ 	"tailscale.com/util/clientmetric"
+@@ -30,6 +32,7 @@ func init() {
+ 	}
+ 	ipnlocal.RegisterC2N("POST /wol", handleC2NWoL)
+ 	ipnlocal.RegisterPeerAPIHandler("/v0/wol", handlePeerAPIWakeOnLAN)
++	localapi.Register("wake-on-lan", serveLocalAPIWakeOnLAN)
+ 	hostinfo.RegisterHostinfoNewHook(func(h *tailcfg.Hostinfo) {
+ 		h.WoLMACs = getWoLMACs()
+ 	})
+@@ -56,34 +59,44 @@ func handleC2NWoL(b *ipnlocal.LocalBackend, w http.ResponseWriter, r *http.Reque
+ 		writeJSON(w, &res)
+ 		return
+ 	}
+-	var password []byte // TODO(bradfitz): support? does anything use WoL passwords?
+ 	for _, mac := range macs {
+-		for ifName, ips := range st.InterfaceIPs {
+-			for _, ip := range ips {
+-				if ip.Addr().IsLoopback() || ip.Addr().Is6() {
+-					continue
+-				}
+-				local := &net.UDPAddr{
+-					IP:   ip.Addr().AsSlice(),
+-					Port: 0,
+-				}
+-				remote := &net.UDPAddr{
+-					IP:   net.IPv4bcast,
+-					Port: 0,
+-				}
+-				if err := wol.Wake(mac, password, local, remote); err != nil {
+-					res.Errors = append(res.Errors, err.Error())
+-				} else {
+-					res.SentTo = append(res.SentTo, ifName)
+-				}
+-				break // one per interface is enough
+-			}
+-		}
++		sentTo, errs := broadcastMagicPacket(st, mac)
++		res.SentTo = append(res.SentTo, sentTo...)
++		res.Errors = append(res.Errors, errs...)
+ 	}
+ 	sort.Strings(res.SentTo)
+ 	writeJSON(w, &res)
+ }
+ 
++// broadcastMagicPacket broadcasts a Wake-on-LAN magic packet for mac on each
++// IPv4 interface in st. It returns the names of the interfaces the packet was
++// sent on and any errors encountered.
++func broadcastMagicPacket(st *netmon.State, mac net.HardwareAddr) (sentTo, errs []string) {
++	var password []byte // TODO(bradfitz): support? does anything use WoL passwords?
++	for ifName, ips := range st.InterfaceIPs {
++		for _, ip := range ips {
++			if ip.Addr().IsLoopback() || ip.Addr().Is6() {
++				continue
++			}
++			local := &net.UDPAddr{
++				IP:   ip.Addr().AsSlice(),
++				Port: 0,
++			}
++			remote := &net.UDPAddr{
++				IP:   net.IPv4bcast,
++				Port: 0,
++			}
++			if err := wol.Wake(mac, password, local, remote); err != nil {
++				errs = append(errs, err.Error())
++			} else {
++				sentTo = append(sentTo, ifName)
++			}
++			break // one per interface is enough
++		}
++	}
++	return sentTo, errs
++}
++
+ func writeJSON(w http.ResponseWriter, v any) {
+ 	w.Header().Set("Content-Type", "application/json")
+ 	json.NewEncoder(w).Encode(v)
+@@ -118,7 +131,6 @@ func handlePeerAPIWakeOnLAN(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r
+ 		http.Error(w, "bad 'mac' param", http.StatusBadRequest)
+ 		return
+ 	}
+-	var password []byte // TODO(bradfitz): support? does anything use WoL passwords?
+ 	st := h.LocalBackend().NetMon().InterfaceState()
+ 	if st == nil {
+ 		http.Error(w, "failed to get interfaces state", http.StatusInternalServerError)
+@@ -128,27 +140,7 @@ func handlePeerAPIWakeOnLAN(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r
+ 		SentTo []string
+ 		Errors []string
+ 	}
+-	for ifName, ips := range st.InterfaceIPs {
+-		for _, ip := range ips {
+-			if ip.Addr().IsLoopback() || ip.Addr().Is6() {
+-				continue
+-			}
+-			local := &net.UDPAddr{
+-				IP:   ip.Addr().AsSlice(),
+-				Port: 0,
+-			}
+-			remote := &net.UDPAddr{
+-				IP:   net.IPv4bcast,
+-				Port: 0,
+-			}
+-			if err := wol.Wake(mac, password, local, remote); err != nil {
+-				res.Errors = append(res.Errors, err.Error())
+-			} else {
+-				res.SentTo = append(res.SentTo, ifName)
+-			}
+-			break // one per interface is enough
+-		}
+-	}
++	res.SentTo, res.Errors = broadcastMagicPacket(st, mac)
+ 	sort.Strings(res.SentTo)
+ 	writeJSON(w, res)
+ }

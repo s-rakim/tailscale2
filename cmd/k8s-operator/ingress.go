@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"tailscale.com/ipn"
+	"tailscale.com/k8s-operator/reconciler"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/clientmetric"
@@ -82,11 +83,11 @@ func (a *IngressReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	if err := a.maybeProvision(ctx, logger, ing); err != nil {
-		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
-			logger.Infof("optimistic lock error, retrying: %s", err)
-		} else {
-			return reconcile.Result{}, err
+		if reconciler.IsOptimisticLockError(err) {
+			logger.Debugf("update conflict, retrying: %v", err)
+			return reconcile.Result{RequeueAfter: shortRequeue}, nil
 		}
+		return reconcile.Result{}, err
 	}
 
 	return reconcile.Result{}, nil

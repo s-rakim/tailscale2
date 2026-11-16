@@ -34,6 +34,7 @@ import (
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/reconciler"
 	"tailscale.com/k8s-operator/reconciler/staticendpoints"
 	"tailscale.com/k8s-operator/reconciler/tailscaled"
 	"tailscale.com/k8s-operator/tsclient"
@@ -56,9 +57,6 @@ const (
 	reasonProxyGroupInvalid            = "ProxyGroupInvalid"
 	reasonProxyGroupTailnetUnavailable = "ProxyGroupTailnetUnavailable"
 	reasonACMEAccountsPendingDeletion  = "ACMEAccountsPendingDeletion"
-
-	// Copied from k8s.io/apiserver/pkg/registry/generic/registry/store.go@cccad306d649184bf2a0e319ba830c53f65c445c
-	optimisticLockErrorMsg = "the object has been modified; please apply your changes to the latest version and try again"
 
 	// The minimum tailcfg.CapabilityVersion that deployed clients are expected
 	// to support to be compatible with the current ProxyGroup controller.
@@ -150,9 +148,9 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		}
 
 		if done, err := r.maybeCleanup(ctx, tsClient, pg); err != nil {
-			if strings.Contains(err.Error(), optimisticLockErrorMsg) {
-				logger.Infof("optimistic lock error, retrying: %s", err)
-				return reconcile.Result{}, nil
+			if reconciler.IsOptimisticLockError(err) {
+				logger.Debugf("update conflict, retrying: %v", err)
+				return reconcile.Result{RequeueAfter: shortRequeue}, nil
 			}
 			return reconcile.Result{}, err
 		} else if !done {
@@ -169,7 +167,13 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 
 	oldPGStatus := pg.Status.DeepCopy()
 	staticEndpoints, nrr, err := r.reconcilePG(ctx, tsClient, pg, logger)
-	return reconcile.Result{}, errors.Join(err, r.maybeUpdateStatus(ctx, logger, pg, oldPGStatus, nrr, staticEndpoints))
+	if err = errors.Join(err, r.maybeUpdateStatus(ctx, logger, pg, oldPGStatus, nrr, staticEndpoints)); err != nil {
+		return reconcile.Result{}, err
+	}
+	if nrr != nil && nrr.requeue {
+		return reconcile.Result{RequeueAfter: shortRequeue}, nil
+	}
+	return reconcile.Result{}, nil
 }
 
 // reconcilePG handles all reconciliation of a ProxyGroup that is not marked
@@ -186,6 +190,21 @@ func (r *ProxyGroupReconciler) reconcilePG(ctx context.Context, tsClient tsclien
 		pg.Finalizers = append(pg.Finalizers, FinalizerName)
 		if err := r.Update(ctx, pg); err != nil {
 			return r.notReadyErrf(pg, logger, "error adding finalizer: %w", err)
+		}
+	}
+
+	// State Secrets are precreated so that the operator can find and delete
+	// them when the ProxyGroup is deleted. Do this before anything that can
+	// block provisioning, so that the update removes the owner reference that
+	// older versions of the operator set.
+	stateSecrets := pgStateSecrets(pg, r.tsNamespace)
+	for _, sec := range stateSecrets {
+		if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, sec, func(s *corev1.Secret) {
+			s.ObjectMeta.Labels = sec.ObjectMeta.Labels
+			s.ObjectMeta.Annotations = sec.ObjectMeta.Annotations
+			s.ObjectMeta.OwnerReferences = sec.ObjectMeta.OwnerReferences
+		}); err != nil {
+			return r.notReadyErrf(pg, logger, "error provisioning state Secrets: %w", err)
 		}
 	}
 
@@ -336,18 +355,6 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, tsClient tscl
 		return r.notReadyErrf(pg, logger, "error provisioning config Secrets: %w", err)
 	}
 
-	// State secrets are precreated so we can use the ProxyGroup CR as their owner ref.
-	stateSecrets := pgStateSecrets(pg, r.tsNamespace)
-	for _, sec := range stateSecrets {
-		if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, sec, func(s *corev1.Secret) {
-			s.ObjectMeta.Labels = sec.ObjectMeta.Labels
-			s.ObjectMeta.Annotations = sec.ObjectMeta.Annotations
-			s.ObjectMeta.OwnerReferences = sec.ObjectMeta.OwnerReferences
-		}); err != nil {
-			return r.notReadyErrf(pg, logger, "error provisioning state Secrets: %w", err)
-		}
-	}
-
 	// auth mode kube-apiserver ProxyGroups use a statically created
 	// ServiceAccount to keep ClusterRole creation permissions limited to the
 	// helm chart installer.
@@ -472,8 +479,8 @@ func (r *ProxyGroupReconciler) maybeUpdateStatus(ctx context.Context, logger *za
 	defer func() {
 		if !apiequality.Semantic.DeepEqual(*oldPGStatus, pg.Status) {
 			if updateErr := r.Client.Status().Update(ctx, pg); updateErr != nil {
-				if strings.Contains(updateErr.Error(), optimisticLockErrorMsg) {
-					logger.Infof("optimistic lock error updating status, retrying: %s", updateErr)
+				if reconciler.IsOptimisticLockError(updateErr) {
+					logger.Debugf("status update conflict, will reconcile on the next event: %v", updateErr)
 					updateErr = nil
 				}
 				err = errors.Join(err, updateErr)
@@ -560,7 +567,11 @@ func (r *ProxyGroupReconciler) cleanupDanglingResources(ctx context.Context, tsC
 
 		// Dangling resource, delete the config + state Secrets, as well as
 		// deleting the device from the tailnet.
-		if err := tailscaled.EnsureDeviceDeleted(ctx, tsClient, logger, m.tsID); err != nil {
+		if m.tsID == "" {
+			if err := tailscaled.EnsureUnreportedDeviceDeleted(ctx, tsClient, logger, m.stateSecret); err != nil {
+				return err
+			}
+		} else if err := tailscaled.EnsureDeviceDeleted(ctx, tsClient, logger, m.tsID); err != nil {
 			return err
 		}
 		if err := r.Delete(ctx, m.stateSecret); err != nil && !apierrors.IsNotFound(err) {
@@ -600,9 +611,10 @@ func (r *ProxyGroupReconciler) cleanupDanglingResources(ctx context.Context, tsC
 	return nil
 }
 
-// maybeCleanup just deletes the device from the tailnet. All the kubernetes
-// resources linked to a ProxyGroup will get cleaned up via owner references
-// (which we can use because they are all in the same namespace).
+// maybeCleanup deletes the ProxyGroup's devices from the tailnet, then deletes
+// its state Secrets (see [pgStateSecrets]). The other Kubernetes resources
+// linked to a ProxyGroup get cleaned up via owner references (which we can use
+// because they are all in the same namespace).
 func (r *ProxyGroupReconciler) maybeCleanup(ctx context.Context, tsClient tsclient.Client, pg *tsapi.ProxyGroup) (bool, error) {
 	logger := r.logger(pg.Name)
 
@@ -612,7 +624,11 @@ func (r *ProxyGroupReconciler) maybeCleanup(ctx context.Context, tsClient tsclie
 	}
 
 	for _, m := range metadata {
-		if err := tailscaled.EnsureDeviceDeleted(ctx, tsClient, logger, m.tsID); err != nil {
+		if m.tsID == "" {
+			if err := tailscaled.EnsureUnreportedDeviceDeleted(ctx, tsClient, logger, m.stateSecret); err != nil {
+				return false, err
+			}
+		} else if err := tailscaled.EnsureDeviceDeleted(ctx, tsClient, logger, m.tsID); err != nil {
 			return false, err
 		}
 	}
@@ -624,6 +640,10 @@ func (r *ProxyGroupReconciler) maybeCleanup(ctx context.Context, tsClient tsclie
 	}
 	if err := maybeCleanupMetricsResources(ctx, mo, r.Client); err != nil {
 		return false, fmt.Errorf("error cleaning up metrics resources: %w", err)
+	}
+
+	if err := r.DeleteAllOf(ctx, &corev1.Secret{}, client.InNamespace(r.tsNamespace), client.MatchingLabels(pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeState))); err != nil {
+		return false, fmt.Errorf("error deleting state Secrets: %w", err)
 	}
 
 	logger.Infof("cleaned up ProxyGroup resources")
@@ -976,7 +996,7 @@ func getNodeMetadata(ctx context.Context, pg *tsapi.ProxyGroup, cl client.Client
 			stateSecret: &secret,
 		}
 
-		prefs, ok, err := getDevicePrefs(&secret)
+		prefs, ok, err := tailscaled.PrefsFromStateSecret(&secret)
 		if err != nil {
 			return nil, err
 		}
@@ -1085,10 +1105,13 @@ func sharedACMEAccountEnabled(pg *tsapi.ProxyGroup, operatorDefault bool) bool {
 
 func (r *ProxyGroupReconciler) notReadyErrf(pg *tsapi.ProxyGroup, logger *zap.SugaredLogger, format string, a ...any) (map[string][]netip.AddrPort, *notReadyReason, error) {
 	err := fmt.Errorf(format, a...)
-	if strings.Contains(err.Error(), optimisticLockErrorMsg) {
-		msg := fmt.Sprintf("optimistic lock error, retrying: %s", err.Error())
-		logger.Info(msg)
-		return notReady(reasonProxyGroupCreating, msg)
+	if reconciler.IsOptimisticLockError(err) {
+		logger.Debugf("update conflict, retrying: %v", err)
+		return nil, &notReadyReason{
+			reason:  reasonProxyGroupCreating,
+			message: "ProxyGroup resources are being updated, retrying",
+			requeue: true,
+		}, nil
 	}
 
 	r.recorder.Event(pg, corev1.EventTypeWarning, reasonProxyGroupCreationFailed, err.Error())
@@ -1101,4 +1124,5 @@ func (r *ProxyGroupReconciler) notReadyErrf(pg *tsapi.ProxyGroup, logger *zap.Su
 type notReadyReason struct {
 	reason  string
 	message string
+	requeue bool // set for optimistic lock errors, which are retried after shortRequeue
 }
